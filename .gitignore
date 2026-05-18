@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# MetaTrader build outputs / binaries
+*.ex5
+*.ex4
+compiled/
+
+# Logs
+compile.log
+*.log
+
+# (Intentionally do NOT ignore source: *.mq5)
+
