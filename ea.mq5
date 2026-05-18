@@ -73,16 +73,33 @@ struct BatchInfo
 
    datetime  created;
 
+   int       requested;
    int       filled;
    int       errors;
+   bool      partial;
+  };
+
+struct PositionState
+  {
+   ulong     ticket;
+   long      magic;
+   string    symbol;
+   int       direction;
+   double    sl;
+   double    tp;
+   bool      hasSL;
+   bool      hasTP;
+   datetime  lastUpdate;
   };
 
 BatchInfo g_Batches[];
+PositionState g_PosStates[];
 bool    g_IsExecuting   = false;
 bool    g_WasConnected  = true;
 bool    g_AbortFlag     = false;
 bool    g_IsDeinitializing = false;
 bool    g_PendingReconnectResync = false;
+datetime g_LastRegistryRebuild = 0;
 bool    g_HoverBuy      = false;
 bool    g_HoverSell     = false;
 int     g_SelectedBatchIndex = -1;
@@ -235,25 +252,37 @@ void OnTimer()
      {
       g_PendingReconnectResync = false;
       LogEvent("RECONNECT", "Processing queued registry rebuild and resync");
-      RebuildBatchRegistryFromPositions();
-      CleanupOrphanBatches();
+      if(TimeCurrent() - g_LastRegistryRebuild >= 2)
+        {
+         RebuildBatchRegistryFromPositions();
+         CleanupOrphanBatches();
+        }
+      else
+        {
+         LogEvent("RECONNECT", "Skipped rebuild (recent snapshot)");
+        }
       ResyncAllBatches();
      }
 
 //--- Drop closed batches before any management pass
-   if(!g_IsExecuting && connected)
-      CleanupOrphanBatches();
+  if(!g_IsExecuting && connected)
+    {
+    CleanupOrphanBatches();
+    CleanupPosStates();
+    }
 
 //--- Panel refresh
    RefreshPanel();
 
 //--- Backup SL/TP sync check (safety net for missed events)
-   if(ArraySize(g_Batches) > 0 && !g_IsExecuting && connected)
-      BackupSyncCheck();
+  bool syncDidWork = false;
+  if(ArraySize(g_Batches) > 0 && !g_IsExecuting && connected)
+    syncDidWork = BackupSyncCheck();
 
 //--- Trailing stop
-   if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 && !g_IsExecuting && connected)
-      ProcessTrailing();
+  if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 && !g_IsExecuting &&
+    connected && !syncDidWork)
+    ProcessTrailing();
   }
 
 //+------------------------------------------------------------------+
@@ -297,6 +326,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
      {
       LogEvent("SYNC_EVENT", "Manual SL/TP change detected batch="+
                IntegerToString(magic));
+      UpsertPosState(ticket, magic, g_Batches[batchIndex].symbol, direction,
+                     pos_sl, pos_tp);
       double targetSL = slImproved ? pos_sl : stored_sl;
       double targetTP = tpImproved ? pos_tp : stored_tp;
       SyncAllPositions(magic, targetSL, targetTP);
@@ -507,8 +538,10 @@ void ExecuteOrders(int direction)
    batch.trailing  = (TrailingStop > 0.0);
    batch.active    = true;
    batch.created   = TimeCurrent();
+  batch.requested = numToOpen;
    batch.filled    = 0;
    batch.errors    = 0;
+  batch.partial   = false;
 
    if(!AddBatch(batch))
      {
@@ -520,6 +553,9 @@ void ExecuteOrders(int direction)
             " symbol="+Symbol()+" direction="+dirStr+
             " requested="+IntegerToString(numToOpen)+
             " lot="+DoubleToString(lot, 2));
+
+    GlobalVariableSet("MOE_KNOWN_"+IntegerToString(batchID), 1.0);
+    GlobalVariableSet("MOE_REQ_"+IntegerToString(batchID), (double)numToOpen);
 
    GlobalVariableSet("MOE_BATCH_ID",   (double)batchID);
    GlobalVariableSet("MOE_BATCH_SL",   g_PanelSL);
@@ -619,6 +655,8 @@ void ExecuteOrders(int direction)
      {
       g_Batches[batchIndex].filled = filled;
       g_Batches[batchIndex].errors = errors;
+      g_Batches[batchIndex].partial = (filled > 0 &&
+                                       filled < g_Batches[batchIndex].requested);
       if(filled <= 0)
          RemoveBatch(batchID);
      }
@@ -684,7 +722,10 @@ void PostFillAttachSLTP(long batchID, int direction)
 
       uint rc = 0;
       if(ModifyPositionSafe(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH"))
+        {
+         UpsertPosState(posInfo.Ticket(), batchID, posSymbol, direction, newSL, newTP);
          UpdateBatchStops(batchID, newSL, newTP);
+        }
      }
 
    batchIndex = FindBatchIndex(batchID);
@@ -728,7 +769,11 @@ void SyncAllPositions(long magic, double newSL, double newTP)
          double applySL = slImprove ? newSL : curSL;
          double applyTP = tpImprove ? newTP : curTP;
          if(ModifyPositionSafe(posInfo.Ticket(), applySL, applyTP, rc, "SYNC"))
+           {
+            UpsertPosState(posInfo.Ticket(), magic, batchSymbol, direction,
+                           applySL, applyTP);
             synced++;
+           }
         }
      }
 
@@ -745,48 +790,78 @@ void SyncAllPositions(long magic, double newSL, double newTP)
 //+------------------------------------------------------------------+
 //| BackupSyncCheck — runs on timer as safety net                   |
 //+------------------------------------------------------------------+
-void BackupSyncCheck()
+bool BackupSyncCheck()
   {
-   int size = ArraySize(g_Batches);
-   long magics[];
-   ArrayResize(magics, size);
-   for(int b = 0; b < size; b++)
-      magics[b] = g_Batches[b].magic;
+  bool modified = false;
 
-   for(int b = 0; b < size; b++)
-     {
-      int batchIndex = FindBatchIndex(magics[b]);
-      if(batchIndex < 0 || !g_Batches[batchIndex].active ||
-         g_Batches[batchIndex].syncing)
-         continue;
+  for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+    if(!posInfo.SelectByIndex(i)) continue;
 
-      long magic = g_Batches[batchIndex].magic;
-      string batchSymbol = g_Batches[batchIndex].symbol;
-      double batchSL = g_Batches[batchIndex].sl;
-      double batchTP = g_Batches[batchIndex].tp;
-      int direction = g_Batches[batchIndex].direction;
-      double drift = SyncDriftThreshold(batchSymbol);
+    long magic = posInfo.Magic();
+    if(magic <= 0) continue;
 
-      for(int i = PositionsTotal()-1; i >= 0; i--)
+    int batchIndex = FindBatchIndex(magic);
+    if(batchIndex < 0 || !g_Batches[batchIndex].active ||
+      g_Batches[batchIndex].syncing)
+      continue;
+
+    string batchSymbol = g_Batches[batchIndex].symbol;
+    if(posInfo.Symbol() != batchSymbol)
+      continue;
+
+    int direction = g_Batches[batchIndex].direction;
+    double drift = SyncDriftThreshold(batchSymbol);
+    ulong ticket = posInfo.Ticket();
+    double curSL = posInfo.StopLoss();
+    double curTP = posInfo.TakeProfit();
+
+    int stateIdx = FindPosStateIndex(ticket);
+    if(stateIdx < 0)
+      {
+      UpsertPosState(ticket, magic, batchSymbol, direction, curSL, curTP);
+      continue;
+      }
+
+    double storedSL = g_PosStates[stateIdx].sl;
+    double storedTP = g_PosStates[stateIdx].tp;
+    bool storedChanged = false;
+
+    if(IsImprovedLevel(direction, storedSL, curSL) &&
+      MathAbs(curSL - storedSL) > drift)
+      {
+      storedSL = curSL;
+      storedChanged = true;
+      }
+    if(IsImprovedLevel(direction, storedTP, curTP) &&
+      MathAbs(curTP - storedTP) > drift)
+      {
+      storedTP = curTP;
+      storedChanged = true;
+      }
+
+    if(storedChanged)
+      UpsertPosState(ticket, magic, batchSymbol, direction, storedSL, storedTP);
+
+    bool slImprove = IsImprovedLevel(direction, curSL, storedSL) &&
+                MathAbs(curSL - storedSL) > drift;
+    bool tpImprove = IsImprovedLevel(direction, curTP, storedTP) &&
+                MathAbs(curTP - storedTP) > drift;
+
+    if(slImprove || tpImprove)
+      {
+      uint rc = 0;
+      double applySL = slImprove ? storedSL : curSL;
+      double applyTP = tpImprove ? storedTP : curTP;
+      if(ModifyPositionSafe(ticket, applySL, applyTP, rc, "BACKUP_SYNC"))
         {
-         if(!posInfo.SelectByIndex(i)) continue;
-         if(posInfo.Magic()  != magic) continue;
-         if(posInfo.Symbol() != batchSymbol) continue;
-
-         double curSL = posInfo.StopLoss();
-         double curTP = posInfo.TakeProfit();
-         bool slImprove = IsImprovedLevel(direction, curSL, batchSL) &&
-                          MathAbs(curSL - batchSL) > drift;
-         bool tpImprove = IsImprovedLevel(direction, curTP, batchTP) &&
-                          MathAbs(curTP - batchTP) > drift;
-
-         if(slImprove || tpImprove)
-           {
-            SyncAllPositions(magic, batchSL, batchTP);
-            return;
-           }
+        UpsertPosState(ticket, magic, batchSymbol, direction, applySL, applyTP);
+        modified = true;
         }
-     }
+      }
+    }
+
+  return modified;
   }
 
 //+------------------------------------------------------------------+
@@ -1016,7 +1091,10 @@ int BreakevenBatch(long magic)
            {
             uint rc = 0;
             if(ModifyPositionSafe(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN"))
-              done++;
+              {
+               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 0, beSL, curTP);
+               done++;
+              }
            }
         }
       else // SELL
@@ -1031,7 +1109,10 @@ int BreakevenBatch(long magic)
            {
             uint rc = 0;
             if(ModifyPositionSafe(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN"))
-              done++;
+              {
+               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 1, beSL, curTP);
+               done++;
+              }
            }
         }
      }
@@ -1171,7 +1252,10 @@ void ProcessTrailingBatch(long magic)
            {
             uint rc = 0;
             if(ModifyPositionSafe(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING"))
-              modified = true;
+              {
+               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 0, newTrail, curTP);
+               modified = true;
+              }
            }
         }
       else // SELL
@@ -1183,7 +1267,10 @@ void ProcessTrailingBatch(long magic)
            {
             uint rc = 0;
             if(ModifyPositionSafe(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING"))
-              modified = true;
+              {
+               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 1, newTrail, curTP);
+               modified = true;
+              }
            }
         }
      }
@@ -1291,9 +1378,16 @@ bool SendMarketOrderSafe(int direction, double lot, double price,
 
       ResetLastError();
       ThrottleTradeRequest();
+      double livePrice = (direction == 0)
+        ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
+        : SymbolInfoDouble(Symbol(), SYMBOL_BID);
+      if(attempt == 0 && price > 0.0)
+        livePrice = price;
+      double liveSL = EnforceStopsLevel(Symbol(), livePrice, sl, direction, false);
+      double liveTP = EnforceStopsLevel(Symbol(), livePrice, tp, direction, true);
       bool ok = (direction == 0)
-         ? trade.Buy(lot, Symbol(), (attempt == 0 ? price : 0.0), sl, tp, comment)
-         : trade.Sell(lot, Symbol(), (attempt == 0 ? price : 0.0), sl, tp, comment);
+        ? trade.Buy(lot, Symbol(), livePrice, liveSL, liveTP, comment)
+        : trade.Sell(lot, Symbol(), livePrice, liveSL, liveTP, comment);
       rc = trade.ResultRetcode();
       int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
@@ -1482,10 +1576,87 @@ bool BatchExists(long magic)
    return (FindBatchIndex(magic) >= 0);
   }
 
+int FindPosStateIndex(ulong ticket)
+  {
+   for(int i = 0; i < ArraySize(g_PosStates); i++)
+     {
+      if(g_PosStates[i].ticket == ticket)
+         return i;
+     }
+   return -1;
+  }
+
+void RemovePosStateAt(int index)
+  {
+   int size = ArraySize(g_PosStates);
+   if(index < 0 || index >= size)
+      return;
+   for(int i = index; i < size - 1; i++)
+      g_PosStates[i] = g_PosStates[i + 1];
+   ArrayResize(g_PosStates, size - 1);
+  }
+
+void UpsertPosState(ulong ticket, long magic, string symbol, int direction,
+                    double sl, double tp)
+  {
+   int idx = FindPosStateIndex(ticket);
+   PositionState ps;
+   ps.ticket = ticket;
+   ps.magic = magic;
+   ps.symbol = symbol;
+   ps.direction = direction;
+   ps.sl = sl;
+   ps.tp = tp;
+   ps.hasSL = (sl > 0.0);
+   ps.hasTP = (tp > 0.0);
+   ps.lastUpdate = TimeCurrent();
+
+   if(idx < 0)
+     {
+      int size = ArraySize(g_PosStates);
+      if(ArrayResize(g_PosStates, size + 1) != size + 1)
+         return;
+      g_PosStates[size] = ps;
+     }
+   else
+     {
+      g_PosStates[idx] = ps;
+     }
+  }
+
+void RemovePosStatesByMagic(long magic)
+  {
+   for(int i = ArraySize(g_PosStates) - 1; i >= 0; i--)
+     {
+      if(g_PosStates[i].magic == magic)
+         RemovePosStateAt(i);
+     }
+  }
+
+void CleanupPosStates()
+  {
+   for(int i = ArraySize(g_PosStates) - 1; i >= 0; i--)
+     {
+      if(!PositionSelectByTicket(g_PosStates[i].ticket))
+         RemovePosStateAt(i);
+     }
+  }
+
+bool IsOurBatchMagic(long magic, string comment)
+  {
+   string key = "MOE_KNOWN_" + IntegerToString(magic);
+   if(GlobalVariableCheck(key))
+      return true;
+
+   string prefix = "MOE_" + IntegerToString(magic) + "_";
+   return (StringFind(comment, prefix) == 0);
+  }
+
 //--- Rebuild the registry from currently open positions
 void RebuildBatchRegistryFromPositions()
   {
    ArrayResize(g_Batches, 0);
+  ArrayResize(g_PosStates, 0);
 
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
@@ -1494,34 +1665,59 @@ void RebuildBatchRegistryFromPositions()
       long magic = posInfo.Magic();
       if(magic <= 0) continue;
 
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(!IsOurBatchMagic(magic, comment))
+        continue;
+
+      int posDir = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 0 : 1;
       int batchIndex = FindBatchIndex(magic);
       datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+
+      UpsertPosState(posInfo.Ticket(), magic, posInfo.Symbol(), posDir,
+             posInfo.StopLoss(), posInfo.TakeProfit());
 
       if(batchIndex < 0)
         {
          BatchInfo batch;
          batch.magic     = magic;
          batch.symbol    = posInfo.Symbol();
-         batch.direction = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 0 : 1;
+        batch.direction = posDir;
          batch.sl        = posInfo.StopLoss();
          batch.tp        = posInfo.TakeProfit();
          batch.syncing   = false;
          batch.trailing  = (TrailingStop > 0.0);
          batch.active    = true;
          batch.created   = opened;
+        string reqKey = "MOE_REQ_" + IntegerToString(magic);
+        int req = GlobalVariableCheck(reqKey)
+          ? (int)GlobalVariableGet(reqKey)
+          : 1;
+        batch.requested = (req > 0) ? req : 1;
          batch.filled    = 1;
          batch.errors    = 0;
+        batch.partial   = (batch.requested > batch.filled);
          AddBatch(batch);
         }
       else
         {
          g_Batches[batchIndex].filled++;
+        int direction = g_Batches[batchIndex].direction;
+        double posSL = posInfo.StopLoss();
+        double posTP = posInfo.TakeProfit();
+        if(IsImprovedLevel(direction, g_Batches[batchIndex].sl, posSL))
+          g_Batches[batchIndex].sl = posSL;
+        if(IsImprovedLevel(direction, g_Batches[batchIndex].tp, posTP))
+          g_Batches[batchIndex].tp = posTP;
+        if(g_Batches[batchIndex].requested > 0)
+          g_Batches[batchIndex].partial =
+            (g_Batches[batchIndex].filled < g_Batches[batchIndex].requested);
          if(opened > 0 && opened < g_Batches[batchIndex].created)
             g_Batches[batchIndex].created = opened;
         }
      }
 
    SaveLatestBatchGlobals();
+    g_LastRegistryRebuild = TimeCurrent();
 
    for(int b = 0; b < ArraySize(g_Batches); b++)
       LogEvent("RECOVERY", "batch="+IntegerToString(g_Batches[b].magic)+
@@ -1536,7 +1732,7 @@ void CleanupOrphanBatches()
   {
    for(int b = ArraySize(g_Batches)-1; b >= 0; b--)
      {
-      if(CountBatchPositions(g_Batches[b].magic) > 0)
+      if(CountBatchPositions(g_Batches[b].magic, g_Batches[b].symbol) > 0)
          continue;
 
       long magic = g_Batches[b].magic;
@@ -1550,20 +1746,53 @@ void CleanupOrphanBatches()
 //--- Re-sync every registered batch using a stable magic snapshot
 void ResyncAllBatches()
   {
-   int size = ArraySize(g_Batches);
-   long magics[];
-   ArrayResize(magics, size);
-   for(int b = 0; b < size; b++)
-      magics[b] = g_Batches[b].magic;
+  for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+    if(!posInfo.SelectByIndex(i)) continue;
 
-   for(int b = 0; b < size; b++)
-     {
-      int batchIndex = FindBatchIndex(magics[b]);
-      if(batchIndex < 0 || !g_Batches[batchIndex].active) continue;
-      SyncAllPositions(g_Batches[batchIndex].magic,
-                       g_Batches[batchIndex].sl,
-                       g_Batches[batchIndex].tp);
-     }
+    long magic = posInfo.Magic();
+    if(magic <= 0) continue;
+
+    int batchIndex = FindBatchIndex(magic);
+    if(batchIndex < 0 || !g_Batches[batchIndex].active ||
+      g_Batches[batchIndex].syncing)
+      continue;
+
+    string batchSymbol = g_Batches[batchIndex].symbol;
+    if(posInfo.Symbol() != batchSymbol)
+      continue;
+
+    ulong ticket = posInfo.Ticket();
+    int stateIdx = FindPosStateIndex(ticket);
+    if(stateIdx < 0)
+      {
+      UpsertPosState(ticket, magic, batchSymbol,
+                g_Batches[batchIndex].direction,
+                posInfo.StopLoss(), posInfo.TakeProfit());
+      continue;
+      }
+
+    int direction = g_PosStates[stateIdx].direction;
+    double drift = SyncDriftThreshold(batchSymbol);
+    double curSL = posInfo.StopLoss();
+    double curTP = posInfo.TakeProfit();
+    double storedSL = g_PosStates[stateIdx].sl;
+    double storedTP = g_PosStates[stateIdx].tp;
+
+    bool slImprove = IsImprovedLevel(direction, curSL, storedSL) &&
+                MathAbs(curSL - storedSL) > drift;
+    bool tpImprove = IsImprovedLevel(direction, curTP, storedTP) &&
+                MathAbs(curTP - storedTP) > drift;
+
+    if(slImprove || tpImprove)
+      {
+      uint rc = 0;
+      double applySL = slImprove ? storedSL : curSL;
+      double applyTP = tpImprove ? storedTP : curTP;
+      if(ModifyPositionSafe(ticket, applySL, applyTP, rc, "RESYNC"))
+        UpsertPosState(ticket, magic, batchSymbol, direction, applySL, applyTP);
+      }
+    }
   }
 
 //--- Check open positions for an existing magic number
@@ -1634,6 +1863,10 @@ bool RemoveBatch(long magic)
    int index = FindBatchIndex(magic);
    if(index < 0)
       return false;
+
+    GlobalVariableDel("MOE_KNOWN_"+IntegerToString(magic));
+    GlobalVariableDel("MOE_REQ_"+IntegerToString(magic));
+    RemovePosStatesByMagic(magic);
 
    int size = ArraySize(g_Batches);
    for(int i = index; i < size - 1; i++)
