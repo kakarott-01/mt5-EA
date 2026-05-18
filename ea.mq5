@@ -58,6 +58,9 @@ CPositionInfo  posInfo;
 //+------------------------------------------------------------------+
 //| GLOBAL STATE                                                      |
 //+------------------------------------------------------------------+
+// batch.sl and batch.tp intentionally remain canonical because this EA
+// uses synchronized basket management. PositionState[] is for persistence
+// and recovery, not independent SL ownership.
 struct BatchInfo
   {
    long      magic;
@@ -89,7 +92,7 @@ struct PositionState
    double    tp;
    bool      hasSL;
    bool      hasTP;
-   datetime  lastUpdate;
+    datetime  lastUpdate;
   };
 
 BatchInfo g_Batches[];
@@ -1694,7 +1697,7 @@ void RebuildBatchRegistryFromPositions()
         if(IsBetterSL(direction, g_Batches[batchIndex].sl, posSL, false))
           g_Batches[batchIndex].sl = posSL;
         double storedTP = g_Batches[batchIndex].tp;
-        if(posTP > 0.0 && (storedTP <= 0.0 || posTP > 0.0))
+        if(posTP > 0.0)
           g_Batches[batchIndex].tp = posTP;
         if(g_Batches[batchIndex].requested > 0)
           g_Batches[batchIndex].partial =
@@ -1911,19 +1914,12 @@ double SyncDriftThreshold(string symbol)
    return GetPipSize(symbol) * 0.5;
   }
 
-bool IsImprovedLevel(int direction, double current, double candidate)
-  {
-   if(candidate <= 0.0)
-      return false;
-   if(current <= 0.0)
-      return true;
-   return (direction == 0) ? (candidate > current) : (candidate < current);
-  }
-
 // SL-specific: BUY wants higher SL, SELL wants lower SL.
 // candidate=0 means "remove SL" — only allowed when allowRemoval=true.
 bool IsBetterSL(int direction, double current, double candidate, bool allowRemoval)
   {
+  if(candidate <= 0.0 && current <= 0.0)
+    return false;
   if(candidate <= 0.0)
     return allowRemoval;
   if(current <= 0.0)
