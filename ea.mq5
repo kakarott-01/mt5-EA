@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "2.00"
+#property version   "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -49,6 +49,18 @@ input group "=== EA SETTINGS ==="
 input long     MagicBase           = 123456;  // Magic Number Base
 input bool     HotkeysEnabled      = true;    // Enable Hotkeys
 
+input group "=== RECOVERY ==="
+input int      ReconnectStableMs     = 500;   // Wait after reconnect before rebuild/resync
+input int      RebuildMinIntervalSec = 2;     // Minimum seconds between rebuilds
+input int      RebuildBackoffMs      = 500;   // Backoff base for rebuild/resync retries
+input int      RebuildMaxAttempts    = 5;     // Max consecutive rebuild/resync attempts
+
+input group "=== DIAGNOSTICS ==="
+input bool     EnableDiagnostics   = true;    // Enable diagnostics logging
+input int      DiagnosticsIntervalMs = 5000;  // Diagnostics interval (ms)
+input int      DiagnosticsQueueWarn = 50;     // Queue backlog warn threshold
+input int      DiagnosticsStateWarnMs = 3000; // Exec-state held warn (ms)
+
 //+------------------------------------------------------------------+
 //| OBJECTS                                                           |
 //+------------------------------------------------------------------+
@@ -80,6 +92,12 @@ struct BatchInfo
    int       filled;
    int       errors;
    bool      partial;
+  // modify flood protection
+  int       modifyCount;
+  uint      modifyWindowStartMs;
+  // close flood protection
+  int       closeCount;
+  uint      closeWindowStartMs;
   };
 
 struct PositionState
@@ -102,7 +120,13 @@ bool    g_WasConnected  = true;
 bool    g_AbortFlag     = false;
 bool    g_IsDeinitializing = false;
 bool    g_PendingReconnectResync = false;
+bool    g_PendingReconnectRebuild = false;
 datetime g_LastRegistryRebuild = 0;
+uint    g_ReconnectDetectedMs = 0;
+int     g_RebuildAttempts = 0;
+uint    g_RebuildNextAllowedMs = 0;
+int     g_ResyncAttempts = 0;
+uint    g_ResyncNextAllowedMs = 0;
 bool    g_HoverBuy      = false;
 bool    g_HoverSell     = false;
 int     g_SelectedBatchIndex = -1;
@@ -116,6 +140,71 @@ int     g_TradeDelayMs = 10;
 const int TRADE_DELAY_MIN_MS = 10;
 const int TRADE_DELAY_MAX_MS = 25;
 const int TRADE_RETRY_MAX    = 4;
+// Modify governance
+const int MODIFY_COOLDOWN_MS = 200; // per-ticket cooldown after a successful modify
+
+struct ModifyLock
+  {
+   ulong ticket;
+   uint  unlockAtMs;
+  };
+
+ModifyLock g_ModifyLocks[];
+// Execution/timer safety
+enum EXEC_STATE { EXEC_IDLE=0, EXEC_EXECUTING=1, EXEC_SYNCING=2, EXEC_TRAILING=3,
+                  EXEC_CLOSING=4, EXEC_RECOVERING=5, EXEC_REBUILDING=6 };
+int    g_ExecState = EXEC_IDLE;
+uint   g_ExecStateStartMs = 0;
+uint   g_LastTimerMs = 0;
+
+// Modify request queue
+struct ModifyRequest
+  {
+   ulong   ticket;
+   double  sl;
+   double  tp;
+   string  context;
+   uint    rc;
+   int     status; // 0=pending,1=success,-1=failed
+   uint    requestedAtMs;
+  };
+
+ModifyRequest g_ModifyQueue[];
+
+// Metrics
+int g_ModifyQueuedCount = 0;
+int g_ModifySuccessCount = 0;
+int g_ModifyFailCount    = 0;
+
+// Diagnostics counters
+uint g_LastDiagMs = 0;
+int  g_TimerSkipCount = 0;
+int  g_SyncSkipCount  = 0;
+int  g_TrailSkipCount = 0;
+int  g_ModQSkipCount  = 0;
+int  g_RebuildSkipCount = 0;
+int  g_CloseSkipCount = 0;
+
+// Retry governance
+struct RetryState
+  {
+   ulong ticket;
+   int   attempts;
+   uint  lastAttemptMs;
+   uint  cooldownMs;
+  };
+
+RetryState g_RetryStates[];
+const int RETRY_ESCALATION_FACTOR = 4; // multiply cooldown on escalation
+
+// Broker flood protection
+const int MAX_MODIFIES_PER_BATCH_PER_MIN = 120; // per-batch cap per minute
+const int MAX_GLOBAL_CONCURRENT_MODIFIES = 6;  // concurrent in-flight modifies
+int g_InFlightModifies = 0;
+const int MAX_CLOSES_PER_BATCH_PER_MIN = 60;   // per-batch close cap per minute
+const int MAX_GLOBAL_CONCURRENT_CLOSES = 4;    // concurrent in-flight closes
+int g_InFlightCloses = 0;
+
 
 //+------------------------------------------------------------------+
 //| PANEL CONSTANTS                                                   |
@@ -234,6 +323,16 @@ void OnTimer()
    if(g_IsDeinitializing)
       return;
 
+   uint nowMs = GetTickCount();
+   // prevent overlapping timer cycles (skip if previous still running)
+   if(g_LastTimerMs != 0 && nowMs - g_LastTimerMs < 50)
+     {
+      LogEvent("TIMER_SKIP", "overlap");
+      g_TimerSkipCount++;
+      return;
+     }
+   g_LastTimerMs = nowMs;
+
    bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
 
 //--- Connection state change
@@ -247,31 +346,100 @@ void OnTimer()
      {
       g_WasConnected = true;
       SetStatus("Reconnected — re-syncing...", clrYellow);
+      g_PendingReconnectRebuild = true;
       g_PendingReconnectResync = true;
+      g_ReconnectDetectedMs = nowMs;
+      g_RebuildAttempts = 0;
+      g_ResyncAttempts = 0;
+      g_RebuildNextAllowedMs = nowMs;
+      g_ResyncNextAllowedMs = nowMs;
       LogEvent("RECONNECT", "Connection restored; resync queued");
      }
 
-   if(connected && g_PendingReconnectResync && !g_IsExecuting)
+   if(connected && (g_PendingReconnectRebuild || g_PendingReconnectResync))
      {
-      g_PendingReconnectResync = false;
-      LogEvent("RECONNECT", "Processing queued registry rebuild and resync");
-      if(TimeCurrent() - g_LastRegistryRebuild >= 2)
+      bool stable = (g_ReconnectDetectedMs == 0 ||
+                     (nowMs - g_ReconnectDetectedMs) >= (uint)ReconnectStableMs);
+      if(!stable)
         {
-         RebuildBatchRegistryFromPositions();
-         CleanupOrphanBatches();
+         LogEvent("RECONNECT", "Waiting for stable connection");
         }
       else
         {
-         LogEvent("RECONNECT", "Skipped rebuild (recent snapshot)");
+         if(g_PendingReconnectRebuild && nowMs >= g_RebuildNextAllowedMs)
+           {
+            LogEvent("RECONNECT", "Processing queued registry rebuild");
+            if(TimeCurrent() - g_LastRegistryRebuild >= RebuildMinIntervalSec)
+              {
+               if(AcquireExecState(EXEC_REBUILDING))
+                 {
+                  RebuildBatchRegistryFromPositions();
+                  CleanupOrphanBatches();
+                  ReleaseExecState(EXEC_REBUILDING);
+                  g_PendingReconnectRebuild = false;
+                  g_RebuildAttempts = 0;
+                 }
+               else
+                 {
+                  g_RebuildAttempts++;
+                  g_RebuildSkipCount++;
+                  if(g_RebuildAttempts >= RebuildMaxAttempts)
+                    {
+                     g_RebuildNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * RebuildMaxAttempts);
+                     LogEvent("RECONNECT", "Rebuild deferred (max attempts)");
+                    }
+                  else
+                    {
+                     g_RebuildNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * MathMax(1, g_RebuildAttempts));
+                     LogEvent("RECONNECT", "Skipped rebuild due to exec lock");
+                    }
+                 }
+              }
+            else
+              {
+               g_PendingReconnectRebuild = false;
+               LogEvent("RECONNECT", "Skipped rebuild (recent snapshot)");
+              }
+           }
+
+         if(g_PendingReconnectResync && !g_PendingReconnectRebuild && nowMs >= g_ResyncNextAllowedMs)
+           {
+            LogEvent("RECONNECT", "Processing queued resync");
+            if(AcquireExecState(EXEC_SYNCING))
+              {
+               ResyncAllBatches();
+               ReleaseExecState(EXEC_SYNCING);
+               g_PendingReconnectResync = false;
+               g_ResyncAttempts = 0;
+              }
+            else
+              {
+               g_ResyncAttempts++;
+               g_SyncSkipCount++;
+               if(g_ResyncAttempts >= RebuildMaxAttempts)
+                 {
+                  g_ResyncNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * RebuildMaxAttempts);
+                  LogEvent("RECONNECT", "Resync deferred (max attempts)");
+                 }
+               else
+                 {
+                  g_ResyncNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * MathMax(1, g_ResyncAttempts));
+                  LogEvent("RECONNECT", "Skipped resync due to exec lock");
+                 }
+              }
+           }
         }
-      ResyncAllBatches();
      }
 
 //--- Drop closed batches before any management pass
-  if(!g_IsExecuting && connected)
+  if(connected)
     {
-    CleanupOrphanBatches();
-    CleanupPosStates();
+    if(AcquireExecState(EXEC_RECOVERING))
+      {
+      CleanupOrphanBatches();
+      CleanupPosStates();
+      ReleaseExecState(EXEC_RECOVERING);
+      }
     }
 
 //--- Panel refresh
@@ -279,13 +447,51 @@ void OnTimer()
 
 //--- Backup SL/TP sync check (safety net for missed events)
   bool syncDidWork = false;
-  if(ArraySize(g_Batches) > 0 && !g_IsExecuting && connected)
-    syncDidWork = BackupSyncCheck();
+  if(ArraySize(g_Batches) > 0 && connected)
+    {
+    if(AcquireExecState(EXEC_SYNCING))
+      {
+      syncDidWork = BackupSyncCheck();
+      ReleaseExecState(EXEC_SYNCING);
+      }
+    else
+      {
+      LogEvent("SYNC_SKIP", "skip BackupSyncCheck due to exec lock");
+      g_SyncSkipCount++;
+      }
+    }
 
-//--- Trailing stop
-  if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 && !g_IsExecuting &&
-    connected && !syncDidWork)
-    ProcessTrailing();
+  //--- Trailing stop
+  if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 && connected && !syncDidWork)
+    {
+    if(AcquireExecState(EXEC_TRAILING))
+      {
+      ProcessTrailing();
+      ReleaseExecState(EXEC_TRAILING);
+      }
+    else
+      {
+      LogEvent("TRAIL_SKIP", "skip trailing due to exec lock");
+      g_TrailSkipCount++;
+      }
+    }
+
+  //--- Process queued modify requests (throttled)
+  if(connected)
+    {
+    if(AcquireExecState(EXEC_EXECUTING))
+      {
+      ProcessModifyQueue();
+      ReleaseExecState(EXEC_EXECUTING);
+      }
+    else
+      {
+      LogEvent("MOD_Q_SKIP", "skip modify queue due to exec lock");
+      g_ModQSkipCount++;
+      }
+    }
+
+  DiagnosticsTick();
   }
 
 //+------------------------------------------------------------------+
@@ -443,10 +649,17 @@ void ExecuteOrders(int direction)
      }
    if(g_IsDeinitializing)
       return;
+   if(!AcquireExecState(EXEC_EXECUTING))
+     {
+      SetStatus("Execution busy. Try again.", clrOrange);
+      LogEvent("EXEC_SKIP", "Exec state busy");
+      return;
+     }
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
      {
       SetStatus("Disconnected. Execution blocked.", clrOrange);
       LogEvent("EXEC_FAIL", "Blocked execution while terminal disconnected");
+      ReleaseExecState(EXEC_EXECUTING);
       return;
      }
    g_IsExecuting = true;
@@ -465,7 +678,7 @@ void ExecuteOrders(int direction)
         {
          SetStatus("Spread "+DoubleToString(spd,1)+" > "+
                    DoubleToString(MaxSpread,1)+" pips. Aborted.", clrOrange);
-         UnlockButtons(); g_IsExecuting=false; return;
+         UnlockButtons(); g_IsExecuting=false; ReleaseExecState(EXEC_EXECUTING); return;
         }
      }
 
@@ -475,7 +688,7 @@ void ExecuteOrders(int direction)
    if(slots <= 0)
      {
       SetStatus("At 200-position limit. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting=false; return;
+      UnlockButtons(); g_IsExecuting=false; ReleaseExecState(EXEC_EXECUTING); return;
      }
    int numToOpen = g_PanelNumTrades;
    if(numToOpen > slots)
@@ -512,13 +725,13 @@ void ExecuteOrders(int direction)
    if(!OrderCalcMargin(oType, Symbol(), lot, priceForCheck, marginPer) || marginPer <= 0.0)
      {
       SetStatus("Margin check failed. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting=false; return;
+      UnlockButtons(); g_IsExecuting=false; ReleaseExecState(EXEC_EXECUTING); return;
      }
    double required = marginPer * numToOpen * 1.2; // 20% safety buffer
    if(AccountInfoDouble(ACCOUNT_MARGIN_FREE) < required)
      {
       SetStatus("Insufficient margin. Need $"+DoubleToString(required,2), clrOrange);
-      UnlockButtons(); g_IsExecuting=false; return;
+      UnlockButtons(); g_IsExecuting=false; ReleaseExecState(EXEC_EXECUTING); return;
      }
 
 //--- 5. GENERATE BATCH ID
@@ -538,11 +751,15 @@ void ExecuteOrders(int direction)
    batch.filled    = 0;
    batch.errors    = 0;
   batch.partial   = false;
+  batch.modifyCount = 0;
+  batch.modifyWindowStartMs = 0;
+  batch.closeCount = 0;
+  batch.closeWindowStartMs = 0;
 
    if(!AddBatch(batch))
      {
       SetStatus("Batch registry failed. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting=false; return;
+      UnlockButtons(); g_IsExecuting=false; ReleaseExecState(EXEC_EXECUTING); return;
      }
    g_SelectedBatchIndex = FindBatchIndex(batchID);
    LogEvent("BATCH_CREATE", "magic="+IntegerToString(batchID)+
@@ -667,6 +884,7 @@ void ExecuteOrders(int direction)
 
    UnlockButtons();
    g_IsExecuting = false;
+  ReleaseExecState(EXEC_EXECUTING);
   }
 
 //+------------------------------------------------------------------+
@@ -717,7 +935,7 @@ void PostFillAttachSLTP(long batchID, int direction)
       newTP = EnforceStopsLevel(posSymbol, openPx, newTP, direction, true);
 
       uint rc = 0;
-      if(ModifyPositionSafe(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH"))
+      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", true))
         {
          UpsertPosState(posInfo.Ticket(), batchID, posSymbol, direction, newSL, newTP);
          UpdateBatchStops(batchID, newSL, newTP);
@@ -735,7 +953,12 @@ void PostFillAttachSLTP(long batchID, int direction)
 void SyncAllPositions(long magic, double newSL, double newTP)
   {
    int batchIndex = FindBatchIndex(magic);
-   if(batchIndex < 0 || g_Batches[batchIndex].syncing) return;
+  if(batchIndex < 0 || g_Batches[batchIndex].syncing) return;
+  if(!AcquireExecState(EXEC_SYNCING))
+    {
+     LogEvent("SYNC_SKIP", "Exec state busy for batch="+IntegerToString(magic));
+     return;
+    }
   g_Batches[batchIndex].syncing = true;
   string batchSymbol = g_Batches[batchIndex].symbol;
   int direction = g_Batches[batchIndex].direction;
@@ -762,10 +985,9 @@ void SyncAllPositions(long magic, double newSL, double newTP)
          uint rc = 0;
          double applySL = slImprove ? newSL : curSL;
          double applyTP = tpImprove ? newTP : curTP;
-         if(ModifyPositionSafe(posInfo.Ticket(), applySL, applyTP, rc, "SYNC"))
+         if(ModifyPositionQueued(posInfo.Ticket(), applySL, applyTP, rc, "SYNC", false))
            {
-            UpsertPosState(posInfo.Ticket(), magic, batchSymbol, direction,
-                           applySL, applyTP);
+            // queued; Upsert will occur when processed by worker
             synced++;
            }
         }
@@ -777,8 +999,9 @@ void SyncAllPositions(long magic, double newSL, double newTP)
             " TP="+DoubleToString(newTP, _Digits));
    SetStatus("Synced SL/TP to "+IntegerToString(synced)+" positions", clrLime);
    batchIndex = FindBatchIndex(magic);
-   if(batchIndex >= 0)
+    if(batchIndex >= 0)
       g_Batches[batchIndex].syncing = false;
+    ReleaseExecState(EXEC_SYNCING);
   }
 
 //+------------------------------------------------------------------+
@@ -843,9 +1066,9 @@ bool BackupSyncCheck()
       uint rc = 0;
       double applySL = slImprove ? storedSL : curSL;
       double applyTP = tpImprove ? storedTP : curTP;
-      if(ModifyPositionSafe(ticket, applySL, applyTP, rc, "BACKUP_SYNC"))
+      if(ModifyPositionQueued(ticket, applySL, applyTP, rc, "BACKUP_SYNC", false))
         {
-        UpsertPosState(ticket, magic, batchSymbol, direction, applySL, applyTP);
+        // queued; pos-state update will happen when worker processes
         modified = true;
         }
       }
@@ -963,6 +1186,14 @@ void CloseAllBatch()
    if(ArraySize(g_Batches) == 0)
      { SetStatus("No active batch to close.", clrOrange); return; }
 
+   if(!AcquireExecState(EXEC_CLOSING))
+     {
+      SetStatus("Close already in progress.", clrOrange);
+      LogEvent("CLOSE_SKIP", "another close in progress");
+      g_CloseSkipCount++;
+      return;
+     }
+
    int size = ArraySize(g_Batches);
    long magics[];
    ArrayResize(magics, size);
@@ -977,6 +1208,7 @@ void CloseAllBatch()
       else
          failedBatches++;
      }
+  ReleaseExecState(EXEC_CLOSING);
 
    string msg = "Closed batches: "+IntegerToString(closedBatches);
    if(failedBatches > 0) msg += " | Failed batches: "+IntegerToString(failedBatches);
@@ -989,10 +1221,24 @@ void CloseAllBatch()
 //+------------------------------------------------------------------+
 bool CloseAllBatch(long magic)
   {
+   bool held = false;
+   if(g_ExecState != EXEC_CLOSING)
+     {
+      if(!AcquireExecState(EXEC_CLOSING))
+        {
+         SetStatus("Close already in progress.", clrOrange);
+         LogEvent("CLOSE_SKIP", "cannot acquire closing lock for batch="+IntegerToString(magic));
+         g_CloseSkipCount++;
+         return false;
+        }
+      held = true;
+     }
+
    int batchIndex = FindBatchIndex(magic);
    if(batchIndex < 0 || !g_Batches[batchIndex].active)
      {
       SetStatus("No active batch to close.", clrOrange);
+      if(held) ReleaseExecState(EXEC_CLOSING);
       return false;
      }
    string batchSymbol = g_Batches[batchIndex].symbol;
@@ -1021,7 +1267,8 @@ bool CloseAllBatch(long magic)
    if(failed > 0) msg += " | Failed: "+IntegerToString(failed);
    SetStatus(msg, (failed == 0) ? clrLime : clrOrange);
    LogEvent("CLOSE", msg);
-   return (failed == 0);
+    if(held) ReleaseExecState(EXEC_CLOSING);
+    return (failed == 0);
   }
 
 //+------------------------------------------------------------------+
@@ -1055,6 +1302,13 @@ int BreakevenBatch(long magic)
    if(batchIndex < 0 || !g_Batches[batchIndex].active)
       return 0;
 
+   if(!AcquireExecState(EXEC_SYNCING))
+     {
+      LogEvent("BREAKEVEN_SKIP", "Exec state busy for batch="+IntegerToString(magic));
+      g_SyncSkipCount++;
+      return 0;
+     }
+
    string batchSymbol = g_Batches[batchIndex].symbol;
    g_Batches[batchIndex].syncing = true;
    int done = 0;
@@ -1080,9 +1334,8 @@ int BreakevenBatch(long magic)
          if(SymbolInfoDouble(batchSymbol, SYMBOL_BID) >= triggerPx && curSL < beSL)
            {
             uint rc = 0;
-            if(ModifyPositionSafe(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN"))
+            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN", false))
               {
-               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 0, beSL, curTP);
                done++;
               }
            }
@@ -1098,9 +1351,8 @@ int BreakevenBatch(long magic)
             && (curSL > beSL || curSL == 0.0))
            {
             uint rc = 0;
-            if(ModifyPositionSafe(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN"))
+            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN", false))
               {
-               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 1, beSL, curTP);
                done++;
               }
            }
@@ -1112,6 +1364,8 @@ int BreakevenBatch(long magic)
    batchIndex = FindBatchIndex(magic);
    if(batchIndex >= 0)
       g_Batches[batchIndex].syncing = false;
+
+  ReleaseExecState(EXEC_SYNCING);
 
    LogEvent("BREAKEVEN", "Applied to "+IntegerToString(done)+
             " positions in batch "+IntegerToString(magic));
@@ -1151,6 +1405,13 @@ int PartialCloseBatch(long magic)
    if(batchIndex < 0 || !g_Batches[batchIndex].active)
       return 0;
 
+   if(!AcquireExecState(EXEC_CLOSING))
+     {
+      LogEvent("PARTIAL_SKIP", "Exec state busy for batch="+IntegerToString(magic));
+      g_CloseSkipCount++;
+      return 0;
+     }
+
    string batchSymbol = g_Batches[batchIndex].symbol;
    int done = 0;
    double vStep = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_STEP);
@@ -1184,6 +1445,7 @@ int PartialCloseBatch(long magic)
    LogEvent("PARTIAL_CLOSE", "batch="+IntegerToString(magic)+
             " pct="+DoubleToString(PartialClosePct, 0)+
             " positions="+IntegerToString(done));
+  ReleaseExecState(EXEC_CLOSING);
    return done;
   }
 
@@ -1241,9 +1503,8 @@ void ProcessTrailingBatch(long magic)
          if(curSL == 0.0 || newTrail > curSL + trailStep)
            {
             uint rc = 0;
-            if(ModifyPositionSafe(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING"))
+            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING", false))
               {
-               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 0, newTrail, curTP);
                modified = true;
               }
            }
@@ -1256,9 +1517,8 @@ void ProcessTrailingBatch(long magic)
          if(curSL == 0.0 || newTrail < curSL - trailStep)
            {
             uint rc = 0;
-            if(ModifyPositionSafe(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING"))
+            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING", false))
               {
-               UpsertPosState(posInfo.Ticket(), magic, batchSymbol, 1, newTrail, curTP);
                modified = true;
               }
            }
@@ -1307,6 +1567,57 @@ bool IsPriceRetcode(uint rc)
            rc == TRADE_RETCODE_PRICE_OFF);
   }
 
+int FindRetryIndex(ulong ticket)
+  {
+   for(int i = 0; i < ArraySize(g_RetryStates); i++)
+      if(g_RetryStates[i].ticket == ticket) return i;
+   return -1;
+  }
+
+void ClearRetryState(ulong ticket)
+  {
+   int idx = FindRetryIndex(ticket);
+   if(idx < 0) return;
+   for(int i = idx; i < ArraySize(g_RetryStates) - 1; i++)
+      g_RetryStates[i] = g_RetryStates[i+1];
+   ArrayResize(g_RetryStates, ArraySize(g_RetryStates) - 1);
+  }
+
+void UpsertRetryStateOnFailure(ulong ticket, int attempt, uint baseCooldown)
+  {
+   int idx = FindRetryIndex(ticket);
+   uint now = GetTickCount();
+   if(idx < 0)
+     {
+      RetryState rs;
+      rs.ticket = ticket;
+      rs.attempts = attempt;
+      rs.lastAttemptMs = now;
+      rs.cooldownMs = baseCooldown;
+      int s = ArraySize(g_RetryStates);
+      if(ArrayResize(g_RetryStates, s+1) == s+1)
+         g_RetryStates[s] = rs;
+     }
+   else
+     {
+      g_RetryStates[idx].attempts = attempt;
+      g_RetryStates[idx].lastAttemptMs = now;
+      // escalate cooldown if many attempts
+      if(attempt >= TRADE_RETRY_MAX)
+         g_RetryStates[idx].cooldownMs = (uint)(g_RetryStates[idx].cooldownMs * RETRY_ESCALATION_FACTOR);
+      else
+         g_RetryStates[idx].cooldownMs = baseCooldown;
+     }
+  }
+
+bool IsUnderRetryCooldown(ulong ticket)
+  {
+   int idx = FindRetryIndex(ticket);
+   if(idx < 0) return false;
+   uint now = GetTickCount();
+   return (now - g_RetryStates[idx].lastAttemptMs) < g_RetryStates[idx].cooldownMs;
+  }
+
 int AdaptiveRetryDelayMs(int attempt, uint rc, int err)
   {
    int delay = 35 + attempt * 45;
@@ -1325,6 +1636,275 @@ void UpdateTradePacing(uint rc, int err, bool success)
       g_TradeDelayMs = (int)MathMax(TRADE_DELAY_MIN_MS, g_TradeDelayMs - 2);
    else if(IsBusyRetcode(rc, err) || IsPriceRetcode(rc))
       g_TradeDelayMs = (int)MathMin(TRADE_DELAY_MAX_MS, g_TradeDelayMs + 5);
+  }
+
+  //--- Modify queue helpers -------------------------------------------
+  int FindQueuedModifyIndex(ulong ticket)
+    {
+     for(int i = 0; i < ArraySize(g_ModifyQueue); i++)
+        if(g_ModifyQueue[i].ticket == ticket) return i;
+     return -1;
+    }
+
+  bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
+    {
+     int idx = FindQueuedModifyIndex(ticket);
+     uint now = GetTickCount();
+     if(idx >= 0)
+       {
+        // dedupe: update latest desired SL/TP and timestamp
+        g_ModifyQueue[idx].sl = sl;
+        g_ModifyQueue[idx].tp = tp;
+        g_ModifyQueue[idx].context = context;
+        g_ModifyQueue[idx].requestedAtMs = now;
+        return true;
+       }
+
+     ModifyRequest req;
+     req.ticket = ticket;
+     req.sl = sl;
+     req.tp = tp;
+     req.context = context;
+     req.rc = 0;
+     req.status = 0;
+     req.requestedAtMs = now;
+     int s = ArraySize(g_ModifyQueue);
+     if(ArrayResize(g_ModifyQueue, s+1) != s+1)
+        return false;
+     g_ModifyQueue[s] = req;
+     g_ModifyQueuedCount++;
+     return true;
+    }
+
+  // Process a limited number of queued modifies per timer tick
+  void ProcessModifyQueue()
+    {
+     int capacity = 2; // max modifies per timer tick
+     int processed = 0;
+     for(int i = ArraySize(g_ModifyQueue) - 1; i >= 0 && processed < capacity; i--)
+       {
+        // pop oldest: queue stored in insertion order; find oldest by requestedAtMs
+        int oldest = -1;
+        uint oldestAt = UINT_MAX;
+        for(int j = 0; j < ArraySize(g_ModifyQueue); j++)
+          {
+           if(g_ModifyQueue[j].requestedAtMs < oldestAt)
+             {
+              oldestAt = g_ModifyQueue[j].requestedAtMs;
+              oldest = j;
+             }
+          }
+        if(oldest < 0) break;
+
+        ModifyRequest req = g_ModifyQueue[oldest];
+
+        // If ticket locked, skip this tick
+        if(IsModifyLocked(req.ticket))
+          {
+           // move on to next
+           break;
+          }
+
+        // Check batch syncing state to avoid modifying during batch-level sync
+        if(PositionSelectByTicket(req.ticket))
+          {
+           long magic = (long)PositionGetInteger(POSITION_MAGIC);
+           int bidx = FindBatchIndex(magic);
+           if(bidx >= 0 && g_Batches[bidx].syncing)
+             {
+              // postpone: leave in queue
+              break;
+             }
+          }
+
+        // Broker flood protection: global in-flight cap
+        if(g_InFlightModifies >= MAX_GLOBAL_CONCURRENT_MODIFIES)
+          {
+           LogEvent("FLOOD_GLOBAL", "in-flight modify cap reached");
+           break;
+          }
+
+        // Check per-batch modify rate limits
+        int bidx = -1;
+        if(PositionSelectByTicket(req.ticket))
+          {
+           long mg = (long)PositionGetInteger(POSITION_MAGIC);
+           bidx = FindBatchIndex(mg);
+          }
+        if(bidx >= 0)
+          {
+           uint now = GetTickCount();
+           if(g_Batches[bidx].modifyWindowStartMs == 0 || now - g_Batches[bidx].modifyWindowStartMs > 60000)
+             {
+              g_Batches[bidx].modifyWindowStartMs = now;
+              g_Batches[bidx].modifyCount = 0;
+             }
+           if(g_Batches[bidx].modifyCount >= MAX_MODIFIES_PER_BATCH_PER_MIN)
+             {
+              LogEvent("FLOOD_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic)+" rate limit reached");
+              // postpone this request
+              continue;
+             }
+           // reserve slot
+           g_Batches[bidx].modifyCount++;
+          }
+
+        // Attempt modification via central worker
+        uint rc = 0;
+        g_InFlightModifies++;
+        bool ok = ModifyPositionSafe(req.ticket, req.sl, req.tp, rc, req.context+"_QUEUED");
+        g_InFlightModifies--;
+        if(ok)
+          {
+           g_ModifySuccessCount++;
+           req.status = 1;
+          }
+        else
+          {
+           g_ModifyFailCount++;
+           req.status = -1;
+          }
+
+        // Remove processed request from queue
+        int qsize = ArraySize(g_ModifyQueue);
+        for(int k = oldest; k < qsize - 1; k++)
+           g_ModifyQueue[k] = g_ModifyQueue[k+1];
+        ArrayResize(g_ModifyQueue, qsize - 1);
+        processed++;
+       }
+    }
+
+  // Public API: queued modify with optional blocking
+  bool ModifyPositionQueued(ulong ticket, double sl, double tp, uint &rc,
+                            string context, bool blocking)
+    {
+     if(blocking)
+       return ModifyPositionSafe(ticket, sl, tp, rc, context);
+
+     // Non-blocking: enqueue and return true if queued
+     bool en = EnqueueModifyRequest(ticket, sl, tp, context);
+     if(!en)
+       {
+        rc = TRADE_RETCODE_REJECT;
+        return false;
+       }
+     rc = 0;
+     return true;
+    }
+
+//--- Execution-state helpers ----------------------------------------
+bool AcquireExecState(int desired)
+  {
+   if(g_ExecState != EXEC_IDLE)
+      return false;
+   g_ExecState = desired;
+   g_ExecStateStartMs = GetTickCount();
+   return true;
+  }
+
+void ReleaseExecState(int expected)
+  {
+   // Normal release when expected matches, or force-release after timeout
+   uint now = GetTickCount();
+   if(g_ExecState == expected || (g_ExecStateStartMs > 0 && now - g_ExecStateStartMs > 10000))
+     {
+      g_ExecState = EXEC_IDLE;
+      g_ExecStateStartMs = 0;
+     }
+  }
+
+  string ExecStateText(int state)
+    {
+    if(state == EXEC_EXECUTING) return "EXECUTING";
+    if(state == EXEC_SYNCING) return "SYNCING";
+    if(state == EXEC_TRAILING) return "TRAILING";
+    if(state == EXEC_CLOSING) return "CLOSING";
+    if(state == EXEC_RECOVERING) return "RECOVERING";
+    if(state == EXEC_REBUILDING) return "REBUILDING";
+    return "IDLE";
+    }
+
+  void DiagnosticsTick()
+    {
+    if(!EnableDiagnostics)
+      return;
+    uint now = GetTickCount();
+    if(g_LastDiagMs > 0 && now - g_LastDiagMs < (uint)DiagnosticsIntervalMs)
+      return;
+
+    g_LastDiagMs = now;
+    int qsize = ArraySize(g_ModifyQueue);
+    string state = ExecStateText(g_ExecState);
+    LogEvent("DIAG", "state="+state+
+          " q="+IntegerToString(qsize)+
+          " inflightM="+IntegerToString(g_InFlightModifies)+
+          " inflightC="+IntegerToString(g_InFlightCloses)+
+          " modOk="+IntegerToString(g_ModifySuccessCount)+
+          " modFail="+IntegerToString(g_ModifyFailCount)+
+          " tSkip="+IntegerToString(g_TimerSkipCount)+
+          " sSkip="+IntegerToString(g_SyncSkipCount)+
+          " trSkip="+IntegerToString(g_TrailSkipCount)+
+          " qSkip="+IntegerToString(g_ModQSkipCount)+
+          " rSkip="+IntegerToString(g_RebuildSkipCount)+
+          " cSkip="+IntegerToString(g_CloseSkipCount));
+
+    if(qsize > DiagnosticsQueueWarn)
+      LogEvent("DIAG_WARN", "modify queue backlog="+IntegerToString(qsize));
+
+    if(g_ExecState != EXEC_IDLE && (now - g_ExecStateStartMs) > (uint)DiagnosticsStateWarnMs)
+      LogEvent("DIAG_WARN", "state held "+state+" for "+IntegerToString((int)(now - g_ExecStateStartMs))+
+            "ms");
+
+    // Reset skip counters per diagnostics interval
+    g_TimerSkipCount = 0;
+    g_SyncSkipCount = 0;
+    g_TrailSkipCount = 0;
+    g_ModQSkipCount = 0;
+    g_RebuildSkipCount = 0;
+    g_CloseSkipCount = 0;
+    }
+
+//--- Per-ticket modify lock helpers ---------------------------------
+int FindModifyLockIndex(ulong ticket)
+  {
+   for(int i = 0; i < ArraySize(g_ModifyLocks); i++)
+      if(g_ModifyLocks[i].ticket == ticket) return i;
+   return -1;
+  }
+
+bool IsModifyLocked(ulong ticket)
+  {
+   uint now = GetTickCount();
+   // Remove expired locks while checking
+   for(int i = ArraySize(g_ModifyLocks) - 1; i >= 0; i--)
+     {
+      if(g_ModifyLocks[i].unlockAtMs <= now)
+        {
+         // remove entry
+         for(int j = i; j < ArraySize(g_ModifyLocks) - 1; j++)
+            g_ModifyLocks[j] = g_ModifyLocks[j+1];
+         ArrayResize(g_ModifyLocks, ArraySize(g_ModifyLocks) - 1);
+        }
+     }
+
+   return (FindModifyLockIndex(ticket) >= 0);
+  }
+
+void LockModify(ulong ticket)
+  {
+   uint now = GetTickCount();
+   int idx = FindModifyLockIndex(ticket);
+   ModifyLock ml;
+   ml.ticket = ticket;
+   ml.unlockAtMs = now + MODIFY_COOLDOWN_MS;
+   if(idx >= 0)
+     g_ModifyLocks[idx] = ml;
+   else
+     {
+      int s = ArraySize(g_ModifyLocks);
+      if(ArrayResize(g_ModifyLocks, s+1) == s+1)
+         g_ModifyLocks[s] = ml;
+     }
   }
 
 void ThrottleTradeRequest()
@@ -1405,6 +1985,41 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
       LogEvent("FROZEN", context+" ticket="+IntegerToString((long)ticket));
       return false;
      }
+
+   // Deduplicate: if our stored pos-state already reflects this SL/TP, no-op
+   int psIdx = FindPosStateIndex(ticket);
+   if(psIdx >= 0)
+     {
+      // ensure the position is selected to get symbol for drift
+      PositionSelectByTicket(ticket);
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double drift = SyncDriftThreshold(sym);
+      double storedSL = g_PosStates[psIdx].sl;
+      double storedTP = g_PosStates[psIdx].tp;
+      if(storedSL == sl && !IsDifferentTP(storedTP, tp, drift))
+        {
+         LogEvent("MOD_NOP", context+" ticket="+IntegerToString((long)ticket)+
+                  " no-change");
+         return true;
+        }
+     }
+
+   // Honor per-ticket modify lock to prevent modify storms
+   if(IsModifyLocked(ticket))
+     {
+      rc = TRADE_RETCODE_LOCKED;
+      LogEvent("MOD_LOCK", context+" ticket="+IntegerToString((long)ticket)+" locked");
+      return false;
+     }
+
+  // Honor retry cooldowns
+  if(IsUnderRetryCooldown(ticket))
+    {
+     rc = TRADE_RETCODE_LOCKED;
+     LogEvent("MOD_COOLDOWN", context+" ticket="+IntegerToString((long)ticket)+" under retry cooldown");
+     return false;
+    }
+
    for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
      {
       if(g_IsDeinitializing ||
@@ -1422,12 +2037,43 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
       bool success = (ok && IsSuccessRetcode(rc));
       UpdateTradePacing(rc, err, success);
       if(success)
+        {
+         // clear retry state and lock this ticket briefly to avoid immediate re-modifies
+         ClearRetryState(ticket);
+         LockModify(ticket);
+         // update pos-state snapshot for future dedupe
+         if(PositionSelectByTicket(ticket))
+           {
+            long magic = (long)PositionGetInteger(POSITION_MAGIC);
+            string sym = PositionGetString(POSITION_SYMBOL);
+            int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 0 : 1;
+            UpsertPosState(ticket, magic, sym, dir, sl, tp);
+           }
          return true;
+        }
 
       LogTradeFailure(context+"_MODIFY_ATTEMPT_"+IntegerToString(attempt + 1),
                       rc, err, trade.ResultComment());
+      // record retry state and escalate cooldowns when hitting retry max
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+      UpsertRetryStateOnFailure(ticket, attempt + 1, baseCd);
       if(!ShouldRetryTrade(rc, err))
+        {
+         // fatal - place a longer lock to avoid repeat attempts
+         LockModify(ticket);
          return false;
+        }
+
+      if(attempt + 1 >= TRADE_RETRY_MAX)
+        {
+         // escalate: block this ticket longer
+         uint longCd = MODIFY_COOLDOWN_MS * RETRY_ESCALATION_FACTOR;
+         int idx = FindModifyLockIndex(ticket);
+         ModifyLock ml;
+         ml.ticket = ticket;
+         ml.unlockAtMs = GetTickCount() + longCd;
+         if(idx >= 0) g_ModifyLocks[idx] = ml; else { int s=ArraySize(g_ModifyLocks); if(ArrayResize(g_ModifyLocks,s+1)==s+1) g_ModifyLocks[s]=ml; }
+        }
 
       Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
      }
@@ -1437,6 +2083,50 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
 bool ClosePositionSafe(ulong ticket, uint &rc, string context)
   {
    rc = 0;
+   if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
+     {
+      rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
+      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
+      return false;
+     }
+
+   int bidx = -1;
+   if(PositionSelectByTicket(ticket))
+     {
+      long mg = (long)PositionGetInteger(POSITION_MAGIC);
+      bidx = FindBatchIndex(mg);
+     }
+   if(bidx >= 0)
+     {
+      uint now = GetTickCount();
+      if(g_Batches[bidx].closeWindowStartMs == 0 || now - g_Batches[bidx].closeWindowStartMs > 60000)
+        {
+         g_Batches[bidx].closeWindowStartMs = now;
+         g_Batches[bidx].closeCount = 0;
+        }
+      if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
+        {
+         rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
+         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
+         return false;
+        }
+      g_Batches[bidx].closeCount++;
+     }
+
+   if(IsUnderRetryCooldown(ticket))
+     {
+      rc = TRADE_RETCODE_LOCKED;
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
+      return false;
+     }
+
+   if(IsUnderRetryCooldown(ticket))
+     {
+      rc = TRADE_RETCODE_LOCKED;
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
+      return false;
+     }
+
    for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
      {
       if(g_IsDeinitializing ||
@@ -1448,18 +2138,25 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
 
       ResetLastError();
       ThrottleTradeRequest();
+      g_InFlightCloses++;
       bool ok = trade.PositionClose(ticket);
+      g_InFlightCloses--;
       rc = trade.ResultRetcode();
       int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
       UpdateTradePacing(rc, err, success);
       if(success)
+        {
+         ClearRetryState(ticket);
          return true;
+        }
 
       LogTradeFailure(context+"_CLOSE_ATTEMPT_"+IntegerToString(attempt + 1),
                       rc, err, trade.ResultComment());
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+      UpsertRetryStateOnFailure(ticket, attempt + 1, baseCd);
       if(!ShouldRetryTrade(rc, err))
-         return false;
+        return false;
 
       Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
      }
@@ -1473,6 +2170,36 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
    if(volume <= 0.0)
       return false;
 
+   if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
+     {
+      rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
+      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
+      return false;
+     }
+
+   int bidx = -1;
+   if(PositionSelectByTicket(ticket))
+     {
+      long mg = (long)PositionGetInteger(POSITION_MAGIC);
+      bidx = FindBatchIndex(mg);
+     }
+   if(bidx >= 0)
+     {
+      uint now = GetTickCount();
+      if(g_Batches[bidx].closeWindowStartMs == 0 || now - g_Batches[bidx].closeWindowStartMs > 60000)
+        {
+         g_Batches[bidx].closeWindowStartMs = now;
+         g_Batches[bidx].closeCount = 0;
+        }
+      if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
+        {
+         rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
+         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
+         return false;
+        }
+      g_Batches[bidx].closeCount++;
+     }
+
    for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
      {
     if(g_IsDeinitializing ||
@@ -1484,18 +2211,25 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
 
       ResetLastError();
       ThrottleTradeRequest();
+      g_InFlightCloses++;
       bool ok = trade.PositionClosePartial(ticket, volume);
+      g_InFlightCloses--;
       rc = trade.ResultRetcode();
       int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
       UpdateTradePacing(rc, err, success);
       if(success)
+        {
+         ClearRetryState(ticket);
          return true;
+        }
 
       LogTradeFailure(context+"_PARTIAL_ATTEMPT_"+IntegerToString(attempt + 1),
                       rc, err, trade.ResultComment());
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+      UpsertRetryStateOnFailure(ticket, attempt + 1, baseCd);
       if(!ShouldRetryTrade(rc, err))
-         return false;
+        return false;
 
       Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
      }
@@ -1686,6 +2420,10 @@ void RebuildBatchRegistryFromPositions()
          batch.filled    = 1;
          batch.errors    = 0;
         batch.partial   = (batch.requested > batch.filled);
+        batch.modifyCount = 0;
+        batch.modifyWindowStartMs = 0;
+        batch.closeCount = 0;
+        batch.closeWindowStartMs = 0;
          AddBatch(batch);
         }
       else
@@ -1778,8 +2516,10 @@ void ResyncAllBatches()
       uint rc = 0;
       double applySL = slImprove ? storedSL : curSL;
       double applyTP = tpImprove ? storedTP : curTP;
-      if(ModifyPositionSafe(ticket, applySL, applyTP, rc, "RESYNC"))
-        UpsertPosState(ticket, magic, batchSymbol, direction, applySL, applyTP);
+      if(ModifyPositionQueued(ticket, applySL, applyTP, rc, "RESYNC", false))
+        {
+         // will be upserted by worker when processed
+        }
       }
     }
   }
