@@ -318,10 +318,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   double drift      = SyncDriftThreshold(g_Batches[batchIndex].symbol);
 
 //--- Only broadcast genuine SL/TP changes for the matching batch
-   bool slChanged = (MathAbs(pos_sl - stored_sl) > drift);
-   bool tpChanged = (MathAbs(pos_tp - stored_tp) > drift);
-   bool slImproved = slChanged && IsImprovedLevel(direction, stored_sl, pos_sl);
-   bool tpImproved = tpChanged && IsImprovedLevel(direction, stored_tp, pos_tp);
+  bool slImproved = IsBetterSL(direction, stored_sl, pos_sl, true);
+  bool tpImproved = IsDifferentTP(stored_tp, pos_tp, drift);
    if(slImproved || tpImproved)
      {
       LogEvent("SYNC_EVENT", "Manual SL/TP change detected batch="+
@@ -331,11 +329,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       double targetSL = slImproved ? pos_sl : stored_sl;
       double targetTP = tpImproved ? pos_tp : stored_tp;
       SyncAllPositions(magic, targetSL, targetTP);
-     }
-   else if(slChanged || tpChanged)
-     {
-      LogEvent("SYNC_BLOCK", "Rejected backward SL/TP change batch="+
-               IntegerToString(magic));
      }
   }
 
@@ -758,10 +751,8 @@ void SyncAllPositions(long magic, double newSL, double newTP)
 
       double curSL = posInfo.StopLoss();
       double curTP = posInfo.TakeProfit();
-      bool slImprove = IsImprovedLevel(direction, curSL, newSL) &&
-               MathAbs(curSL - newSL) > drift;
-      bool tpImprove = IsImprovedLevel(direction, curTP, newTP) &&
-               MathAbs(curTP - newTP) > drift;
+      bool slImprove = IsBetterSL(direction, curSL, newSL, true);
+      bool tpImprove = IsDifferentTP(curTP, newTP, drift);
 
       if(slImprove || tpImprove)
         {
@@ -827,14 +818,12 @@ bool BackupSyncCheck()
     double storedTP = g_PosStates[stateIdx].tp;
     bool storedChanged = false;
 
-    if(IsImprovedLevel(direction, storedSL, curSL) &&
-      MathAbs(curSL - storedSL) > drift)
+    if(IsBetterSL(direction, storedSL, curSL, true))
       {
       storedSL = curSL;
       storedChanged = true;
       }
-    if(IsImprovedLevel(direction, storedTP, curTP) &&
-      MathAbs(curTP - storedTP) > drift)
+    if(IsDifferentTP(storedTP, curTP, drift))
       {
       storedTP = curTP;
       storedChanged = true;
@@ -843,10 +832,8 @@ bool BackupSyncCheck()
     if(storedChanged)
       UpsertPosState(ticket, magic, batchSymbol, direction, storedSL, storedTP);
 
-    bool slImprove = IsImprovedLevel(direction, curSL, storedSL) &&
-                MathAbs(curSL - storedSL) > drift;
-    bool tpImprove = IsImprovedLevel(direction, curTP, storedTP) &&
-                MathAbs(curTP - storedTP) > drift;
+    bool slImprove = IsBetterSL(direction, curSL, storedSL, true);
+    bool tpImprove = IsDifferentTP(curTP, storedTP, drift);
 
     if(slImprove || tpImprove)
       {
@@ -1704,9 +1691,10 @@ void RebuildBatchRegistryFromPositions()
         int direction = g_Batches[batchIndex].direction;
         double posSL = posInfo.StopLoss();
         double posTP = posInfo.TakeProfit();
-        if(IsImprovedLevel(direction, g_Batches[batchIndex].sl, posSL))
+        if(IsBetterSL(direction, g_Batches[batchIndex].sl, posSL, false))
           g_Batches[batchIndex].sl = posSL;
-        if(IsImprovedLevel(direction, g_Batches[batchIndex].tp, posTP))
+        double storedTP = g_Batches[batchIndex].tp;
+        if(posTP > 0.0 && (storedTP <= 0.0 || posTP > 0.0))
           g_Batches[batchIndex].tp = posTP;
         if(g_Batches[batchIndex].requested > 0)
           g_Batches[batchIndex].partial =
@@ -1779,10 +1767,8 @@ void ResyncAllBatches()
     double storedSL = g_PosStates[stateIdx].sl;
     double storedTP = g_PosStates[stateIdx].tp;
 
-    bool slImprove = IsImprovedLevel(direction, curSL, storedSL) &&
-                MathAbs(curSL - storedSL) > drift;
-    bool tpImprove = IsImprovedLevel(direction, curTP, storedTP) &&
-                MathAbs(curTP - storedTP) > drift;
+    bool slImprove = IsBetterSL(direction, curSL, storedSL, true);
+    bool tpImprove = IsDifferentTP(curTP, storedTP, drift);
 
     if(slImprove || tpImprove)
       {
@@ -1932,6 +1918,30 @@ bool IsImprovedLevel(int direction, double current, double candidate)
    if(current <= 0.0)
       return true;
    return (direction == 0) ? (candidate > current) : (candidate < current);
+  }
+
+// SL-specific: BUY wants higher SL, SELL wants lower SL.
+// candidate=0 means "remove SL" — only allowed when allowRemoval=true.
+bool IsBetterSL(int direction, double current, double candidate, bool allowRemoval)
+  {
+  if(candidate <= 0.0)
+    return allowRemoval;
+  if(current <= 0.0)
+    return true;
+  return (direction == 0) ? (candidate > current) : (candidate < current);
+  }
+
+// TP-specific: TP can move freely in any direction, and can be removed.
+// Only reject if value is unchanged (within drift).
+bool IsDifferentTP(double current, double candidate, double drift)
+  {
+  if(candidate <= 0.0 && current <= 0.0)
+    return false;
+  if(candidate <= 0.0 && current > 0.0)
+    return true;
+  if(current <= 0.0 && candidate > 0.0)
+    return true;
+  return (MathAbs(candidate - current) > drift);
   }
 
 //--- Normalize lot to broker step
