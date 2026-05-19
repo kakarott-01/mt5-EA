@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.01"
+#property version   "4.02"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -134,8 +134,6 @@ const int TRADE_RETRY_MAX    = 4;
 const int MODIFY_COOLDOWN_MS = 200;
 
 // FIX 4: State-dependent exec-state timeouts
-// EXEC_EXECUTING needs a much longer window to cover 200-trade loops under retries.
-// All other states (SYNCING, TRAILING, CLOSING, etc.) keep the 10-second guard.
 const int EXEC_STATE_TIMEOUT_MS     = 10000;  // 10 s  — all states except executing
 const int EXEC_EXECUTING_TIMEOUT_MS = 120000; // 2 min — execution loop (200 trades max)
 
@@ -189,7 +187,13 @@ struct RetryState
 RetryState g_RetryStates[];
 const int RETRY_ESCALATION_FACTOR = 4;
 
-const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 120;
+// FIX: Raised from 120 to 360 to match capacity=6 throughput.
+// At capacity=6 and 100ms timer, max throughput = 6 * 600 = 3600/min.
+// 120 was calibrated for the old capacity=2 (120/min exact match).
+// With capacity=6, 120 was saturated in ~2 seconds of sustained trailing,
+// blocking ~80 of 200 trailing positions for the remaining 58 seconds.
+// 360 = 6 per tick * 600 ticks/min — matches actual processing capacity.
+const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 360;
 const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
 int g_InFlightModifies = 0;
 const int MAX_CLOSES_PER_BATCH_PER_MIN    = 60;
@@ -435,11 +439,6 @@ void OnTimer()
 
    //--- Panel refresh
    RefreshPanel();
-
-   // FIX 4: Guard all timer-driven operations behind !g_IsExecuting.
-   // If EXEC_EXECUTING is force-released by the 2-minute timeout while the execution
-   // loop is still running, these guards prevent BackupSyncCheck, trailing, and the
-   // modify queue from interleaving with the active execution loop.
 
    //--- Backup SL/TP sync check (safety net for missed events)
    bool syncDidWork = false;
@@ -910,6 +909,13 @@ void ExecuteOrders(int direction)
 
 //+------------------------------------------------------------------+
 //| PostFillAttachSLTP — safety net for market execution mode        |
+//|                                                                   |
+//| FIX: Removed premature UpsertPosState and UpdateBatchStops calls |
+//| after EnqueueModifyRequest (blocking=false). Those calls updated  |
+//| PosState and batch.sl/tp before broker confirmation, which caused |
+//| BackupSyncCheck to skip repair for positions that hadn't yet had  |
+//| their SL/TP confirmed. ModifyPositionSafe's success path already  |
+//| handles UpsertPosState and UpdateBatchStops on confirmed modify.  |
 //+------------------------------------------------------------------+
 void PostFillAttachSLTP(long batchID, int direction)
   {
@@ -955,11 +961,11 @@ void PostFillAttachSLTP(long batchID, int direction)
       newTP = EnforceStopsLevel(posSymbol, openPx, newTP, direction, true);
 
       uint rc = 0;
-      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false))
-        {
-         UpsertPosState(posInfo.Ticket(), batchID, posSymbol, direction, newSL, newTP);
-         UpdateBatchStops(batchID, newSL, newTP);
-        }
+      // Enqueue only — do NOT call UpsertPosState or UpdateBatchStops here.
+      // ModifyPositionSafe's confirmed success path handles both updates.
+      // Premature state updates before broker confirmation caused
+      // BackupSyncCheck to suppress repair for unconfirmed positions.
+      ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false);
      }
 
    batchIndex = FindBatchIndex(batchID);
@@ -1313,8 +1319,6 @@ int PartialCloseBatch(long magic)
    double vMin  = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_MIN);
 
    // FIX 1: Release exec-state before this early return.
-   // Original code returned 0 here while EXEC_CLOSING was still held,
-   // permanently locking all close operations for 10 seconds.
    if(vStep <= 0.0 || vMin <= 0.0)
      {
       LogEvent("EXEC_FAIL", "Invalid volume settings for "+batchSymbol+
@@ -1593,19 +1597,8 @@ void RemoveModifyQueueItem(int index, bool &skipped[])
 //+------------------------------------------------------------------+
 //| ProcessModifyQueue — throttled modify worker                     |
 //|                                                                   |
-//| FIX 2: The original outer for(i) loop was never used inside the  |
-//| body. break on a locked/syncing item froze the entire queue for   |
-//| the tick. continue on a rate-limited item re-found the same item  |
-//| (O(n²) waste and starvation). Rewritten as a while loop with a   |
-//| skipped[] sentinel that marks blocked items for this tick so the  |
-//| oldest-search skips them, allowing younger processable items to   |
-//| be dispatched instead.                                            |
-//|                                                                   |
-//| FIX 3: modifyCount is now incremented ONLY on successful modify.  |
-//| Previously it was incremented before the attempt, causing broker  |
-//| rejection storms to consume the per-batch rate-limit window via   |
-//| failed requests alone, blocking legitimate modifications for up   |
-//| to 60 seconds.                                                    |
+//| FIX 2: Rewritten as while loop with skipped[] sentinel.          |
+//| FIX 3: modifyCount incremented ONLY on successful modify.        |
 //+------------------------------------------------------------------+
 void ProcessModifyQueue()
   {
@@ -1613,10 +1606,6 @@ void ProcessModifyQueue()
    int processed = 0;
    if(ArraySize(g_ModifyQueue) == 0) return;
 
-   // skipped[] mirrors g_ModifyQueue[] indices. Items that cannot be
-   // processed this tick (locked / syncing / rate-limited) are marked
-   // true so the oldest-item search ignores them. The array is kept in
-   // sync with g_ModifyQueue[] whenever an item is removed.
    bool skipped[];
    ArrayResize(skipped, ArraySize(g_ModifyQueue));
    ArrayInitialize(skipped, false);
@@ -1635,21 +1624,18 @@ void ProcessModifyQueue()
             g_ModifyQueue[j].requestedAtMs < g_ModifyQueue[oldest].requestedAtMs)
             oldest = j;
         }
-      if(oldest < 0) break; // All remaining items are skipped
+      if(oldest < 0) break;
 
       ModifyRequest req = g_ModifyQueue[oldest];
 
-      // Hard stop: global in-flight cap. Nothing more can be dispatched this tick.
       if(g_InFlightModifies >= MAX_GLOBAL_CONCURRENT_MODIFIES)
         {
          LogEvent("FLOOD_GLOBAL", "in-flight modify cap reached");
          break;
         }
 
-      // Resolve position existence and batch membership in one call
       if(!PositionSelectByTicket(req.ticket))
         {
-         // Position is closed; drop the stale request silently and keep searching
          RemoveModifyQueueItem(oldest, skipped);
          continue;
         }
@@ -1657,21 +1643,18 @@ void ProcessModifyQueue()
       long mg   = (long)PositionGetInteger(POSITION_MAGIC);
       int  bidx = FindBatchIndex(mg);
 
-      // Skip (don't break) if batch is mid-sync — try next oldest item
       if(bidx >= 0 && g_Batches[bidx].syncing)
         {
          if(oldest < ArraySize(skipped)) skipped[oldest] = true;
          continue;
         }
 
-      // Skip (don't break) if ticket is modify-locked — try next oldest item
       if(IsModifyLocked(req.ticket))
         {
          if(oldest < ArraySize(skipped)) skipped[oldest] = true;
          continue;
         }
 
-      // Per-batch modify rate limit — skip this item, try next
       if(bidx >= 0)
         {
          uint now = GetTickCount();
@@ -1690,7 +1673,6 @@ void ProcessModifyQueue()
            }
         }
 
-      // Attempt modification
       uint rc = 0;
       g_InFlightModifies++;
       bool ok = ModifyPositionSafe(req.ticket, req.sl, req.tp, rc,
@@ -1700,9 +1682,7 @@ void ProcessModifyQueue()
       if(ok)
         {
          g_ModifySuccessCount++;
-         // FIX 3: Only count against the rate limit on success.
-         // Failed attempts must NOT consume rate-limit slots so that
-         // broker rejection storms cannot lock out legitimate modifies.
+         // FIX 3: Only count against rate limit on success.
          if(bidx >= 0) g_Batches[bidx].modifyCount++;
         }
       else
@@ -1710,7 +1690,6 @@ void ProcessModifyQueue()
          g_ModifyFailCount++;
         }
 
-      // Remove the processed request and keep skipped[] synchronized
       RemoveModifyQueueItem(oldest, skipped);
       processed++;
      }
@@ -1742,12 +1721,6 @@ bool AcquireExecState(int desired)
    return true;
   }
 
-// FIX 4: Use a state-dependent timeout.
-// EXEC_EXECUTING needs 2 minutes to cover a 200-trade loop under
-// worst-case retry conditions. All other states keep 10 seconds.
-// Additionally, OnTimer guards all timer operations behind !g_IsExecuting
-// so that even if the 2-minute timeout triggers, the execution loop
-// is protected from timer-driven sync/trailing/modify interleaving.
 void ReleaseExecState(int expected)
   {
    uint now = GetTickCount();
@@ -2074,8 +2047,6 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
       g_Batches[bidx].closeCount++;
      }
 
-   // FIX 5: Removed the duplicate IsUnderRetryCooldown check that was
-   // copy-pasted verbatim immediately after this one. One check is correct.
    if(IsUnderRetryCooldown(ticket))
      {
       rc = TRADE_RETCODE_LOCKED;
@@ -2116,6 +2087,13 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
    return false;
   }
 
+//+------------------------------------------------------------------+
+//| ClosePositionPartialSafe                                          |
+//|                                                                   |
+//| FIX: Added IsUnderRetryCooldown check to match ClosePositionSafe.|
+//| Previously missing, allowing cooling-down tickets to be hammered  |
+//| by partial close retries without per-ticket cooldown enforcement. |
+//+------------------------------------------------------------------+
 bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
                               string context)
   {
@@ -2126,6 +2104,14 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
      {
       rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
       LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
+      return false;
+     }
+
+   // FIX Priority 4: Added retry cooldown check — consistent with ClosePositionSafe.
+   if(IsUnderRetryCooldown(ticket))
+     {
+      rc = TRADE_RETCODE_LOCKED;
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
       return false;
      }
 
@@ -2612,25 +2598,19 @@ double EnforceStopsLevel(string symbol, double price, double level, int dir,
                   : NormalizeDouble(price + minDist, digits);
   }
 
+//+------------------------------------------------------------------+
+//| DetectFillingMode                                                 |
+//|                                                                   |
+//| FIX C-8: Removed orphaned code block that was accidentally       |
+//| copy-pasted here during Phase 6-C implementation. The block      |
+//| referenced undeclared identifiers magic/sym/sl/tp/dir, causing   |
+//| 8 compilation errors. The correct implementation of that logic   |
+//| already exists in ModifyPositionSafe's success path.             |
+//+------------------------------------------------------------------+
 ENUM_ORDER_TYPE_FILLING DetectFillingMode()
   {
    int mode = (int)SymbolInfoInteger(Symbol(), SYMBOL_FILLING_MODE);
    if((mode & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
-            int bidx = FindBatchIndex(magic);
-            if(bidx >= 0)
-              {
-               double drift = SyncDriftThreshold(sym);
-               double curSL = g_Batches[bidx].sl;
-               double curTP = g_Batches[bidx].tp;
-               bool slImprove = IsBetterSL(dir, curSL, sl, false);
-               bool tpImprove = IsDifferentTP(curTP, tp, drift);
-               if(slImprove || tpImprove)
-                 {
-                  double newSL = slImprove ? sl : curSL;
-                  double newTP = tpImprove ? tp : curTP;
-                  UpdateBatchStops(magic, newSL, newTP);
-                 }
-              }
    if((mode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
    return ORDER_FILLING_RETURN;
   }
