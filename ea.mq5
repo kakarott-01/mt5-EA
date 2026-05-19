@@ -904,7 +904,7 @@ void PostFillAttachSLTP(long batchID, int direction)
       newTP = EnforceStopsLevel(posSymbol, openPx, newTP, direction, true);
 
       uint rc = 0;
-      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", true))
+      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false))
         {
          UpsertPosState(posInfo.Ticket(), batchID, posSymbol, direction, newSL, newTP);
          UpdateBatchStops(batchID, newSL, newTP);
@@ -1645,7 +1645,7 @@ void RemoveModifyQueueItem(int index, bool &skipped[])
 //+------------------------------------------------------------------+
 void ProcessModifyQueue()
   {
-   const int capacity = 2; // max successful modifies dispatched per timer tick
+   const int capacity = 6; // max successful modifies dispatched per timer tick
    int processed = 0;
    if(ArraySize(g_ModifyQueue) == 0) return;
 
@@ -2021,6 +2021,21 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
             string sym = PositionGetString(POSITION_SYMBOL);
             int dir    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 0 : 1;
             UpsertPosState(ticket, magic, sym, dir, sl, tp);
+            int bidx = FindBatchIndex(magic);
+            if(bidx >= 0)
+              {
+               double drift = SyncDriftThreshold(sym);
+               double curSL = g_Batches[bidx].sl;
+               double curTP = g_Batches[bidx].tp;
+               bool slImprove = IsBetterSL(dir, curSL, sl, false);
+               bool tpImprove = IsDifferentTP(curTP, tp, drift);
+               if(slImprove || tpImprove)
+                 {
+                  double newSL = slImprove ? sl : curSL;
+                  double newTP = tpImprove ? tp : curTP;
+                  UpdateBatchStops(magic, newSL, newTP);
+                 }
+              }
            }
          return true;
         }
@@ -2527,7 +2542,7 @@ long GenerateBatchMagic()
    static long counter = 0;
    long magic = 0;
    do
-     {
+      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false))
       counter++;
       magic = MagicBase + ((long)TimeCurrent() * 1000000) + counter;
      }
@@ -2634,6 +2649,21 @@ ENUM_ORDER_TYPE_FILLING DetectFillingMode()
   {
    int mode = (int)SymbolInfoInteger(Symbol(), SYMBOL_FILLING_MODE);
    if((mode & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+            int bidx = FindBatchIndex(magic);
+            if(bidx >= 0)
+              {
+               double drift = SyncDriftThreshold(sym);
+               double curSL = g_Batches[bidx].sl;
+               double curTP = g_Batches[bidx].tp;
+               bool slImprove = IsBetterSL(dir, curSL, sl, false);
+               bool tpImprove = IsDifferentTP(curTP, tp, drift);
+               if(slImprove || tpImprove)
+                 {
+                  double newSL = slImprove ? sl : curSL;
+                  double newTP = tpImprove ? tp : curTP;
+                  UpdateBatchStops(magic, newSL, newTP);
+                 }
+              }
    if((mode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
    return ORDER_FILLING_RETURN;
   }
