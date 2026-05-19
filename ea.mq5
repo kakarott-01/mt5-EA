@@ -277,6 +277,16 @@ int OnInit()
 
    CreatePanel();
 
+   bool acctAllowed = (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
+   bool termAllowed = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   long tradeMode   = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_MODE);
+   if(!acctAllowed || !termAllowed || tradeMode == SYMBOL_TRADE_MODE_DISABLED)
+     {
+      SetStatus("Trading disabled. EA stopped.", clrOrange);
+      Alert("ApexExecution: Trading disabled. EA stopped.");
+      return INIT_FAILED;
+     }
+
    if(!EventSetMillisecondTimer(100))
       LogEvent("INIT_WARN", "Timer setup failed. Error="+IntegerToString(GetLastError()));
 
@@ -637,6 +647,40 @@ void ExecuteOrders(int direction)
       ReleaseExecState(EXEC_EXECUTING);
       return;
      }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ||
+      !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     {
+      SetStatus("Trading disabled. Execution blocked.", clrOrange);
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
+   long tradeMode = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_MODE);
+   if(tradeMode == SYMBOL_TRADE_MODE_DISABLED)
+     {
+      SetStatus("Symbol trading disabled. Execution blocked.", clrOrange);
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
+   if(tradeMode == SYMBOL_TRADE_MODE_LONGONLY && direction != 0)
+     {
+      SetStatus("Symbol LONGONLY. Sell blocked.", clrOrange);
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
+   if(tradeMode == SYMBOL_TRADE_MODE_SHORTONLY && direction == 0)
+     {
+      SetStatus("Symbol SHORTONLY. Buy blocked.", clrOrange);
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
+   if(tradeMode != SYMBOL_TRADE_MODE_FULL &&
+      tradeMode != SYMBOL_TRADE_MODE_LONGONLY &&
+      tradeMode != SYMBOL_TRADE_MODE_SHORTONLY)
+     {
+      SetStatus("Symbol trade mode not FULL. Execution blocked.", clrOrange);
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
    g_IsExecuting = true;
    g_AbortFlag   = false;
    string dirStr = (direction == 0) ? "BUY" : "SELL";
@@ -690,6 +734,12 @@ void ExecuteOrders(int direction)
      }
    else
       lot = NormalizeLot(lot);
+
+   if(lot <= 0.0)
+     {
+      SetStatus("Invalid lot (symbol info unavailable).", clrOrange);
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+     }
 
    //--- 4. MARGIN CHECK
    double marginPer = 0.0;
@@ -798,6 +848,7 @@ void ExecuteOrders(int direction)
         }
 
       uint rc = 0;
+      // NOTE: SL/TP are sent at order time; PostFillAttachSLTP is a safety net.
       bool sent = SendMarketOrderSafe(direction, lot, price, sl_price, tp_price, cmt, rc);
 
       if(sent)
@@ -820,7 +871,7 @@ void ExecuteOrders(int direction)
         }
       else
         {
-         LogTradeFailure("ORDER", rc, GetLastError(), trade.ResultComment());
+         LogTradeFailure("ORDER", rc, 0, trade.ResultComment());
          errors++;
         }
 
@@ -933,10 +984,6 @@ void SyncAllPositions(long magic, double newSL, double newTP)
    int direction      = g_Batches[batchIndex].direction;
    double drift       = SyncDriftThreshold(batchSymbol);
 
-   g_Batches[batchIndex].sl = newSL;
-   g_Batches[batchIndex].tp = newTP;
-   SaveLatestBatchGlobals();
-
    int synced = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
@@ -958,6 +1005,9 @@ void SyncAllPositions(long magic, double newSL, double newTP)
             synced++;
         }
      }
+
+   if(synced > 0)
+      UpdateBatchStops(magic, newSL, newTP);
 
    LogEvent("SYNC", "batch="+IntegerToString(magic)+
             " positions="+IntegerToString(synced)+
@@ -1117,44 +1167,6 @@ void PartialCloseSelectedBatch()
   }
 
 //+------------------------------------------------------------------+
-//| CloseAllBatch — close every registered batch                     |
-//+------------------------------------------------------------------+
-void CloseAllBatch()
-  {
-   if(ArraySize(g_Batches) == 0)
-     { SetStatus("No active batch to close.", clrOrange); return; }
-
-   if(!AcquireExecState(EXEC_CLOSING))
-     {
-      SetStatus("Close already in progress.", clrOrange);
-      LogEvent("CLOSE_SKIP", "another close in progress");
-      g_CloseSkipCount++;
-      return;
-     }
-
-   int size = ArraySize(g_Batches);
-   long magics[];
-   ArrayResize(magics, size);
-   for(int b = 0; b < size; b++)
-      magics[b] = g_Batches[b].magic;
-
-   int closedBatches = 0, failedBatches = 0;
-   for(int b = 0; b < size; b++)
-     {
-      if(CloseAllBatch(magics[b]))
-         closedBatches++;
-      else
-         failedBatches++;
-     }
-   ReleaseExecState(EXEC_CLOSING);
-
-   string msg = "Closed batches: "+IntegerToString(closedBatches);
-   if(failedBatches > 0) msg += " | Failed batches: "+IntegerToString(failedBatches);
-   SetStatus(msg, (failedBatches == 0) ? clrLime : clrOrange);
-   LogEvent("CLOSE", msg);
-  }
-
-//+------------------------------------------------------------------+
 //| CloseAllBatch — close only one target batch                      |
 //+------------------------------------------------------------------+
 bool CloseAllBatch(long magic)
@@ -1206,28 +1218,6 @@ bool CloseAllBatch(long magic)
    LogEvent("CLOSE", msg);
    if(held) ReleaseExecState(EXEC_CLOSING);
    return (failed == 0);
-  }
-
-//+------------------------------------------------------------------+
-//| BreakevenAll — move SL to breakeven on every registered batch    |
-//+------------------------------------------------------------------+
-void BreakevenAll()
-  {
-   if(ArraySize(g_Batches) == 0)
-     { SetStatus("No active batch.", clrOrange); return; }
-
-   int size = ArraySize(g_Batches);
-   long magics[];
-   ArrayResize(magics, size);
-   for(int b = 0; b < size; b++)
-      magics[b] = g_Batches[b].magic;
-
-   int done = 0;
-   for(int b = 0; b < size; b++)
-      done += BreakevenBatch(magics[b]);
-
-   SetStatus("Breakeven set on "+IntegerToString(done)+" positions", clrLime);
-   LogEvent("BREAKEVEN", "Applied to "+IntegerToString(done)+" positions");
   }
 
 //+------------------------------------------------------------------+
@@ -1300,30 +1290,6 @@ int BreakevenBatch(long magic)
    LogEvent("BREAKEVEN", "Applied to "+IntegerToString(done)+
             " positions in batch "+IntegerToString(magic));
    return done;
-  }
-
-//+------------------------------------------------------------------+
-//| PartialCloseAll — partially close every registered batch         |
-//+------------------------------------------------------------------+
-void PartialCloseAll()
-  {
-   if(ArraySize(g_Batches) == 0)
-     { SetStatus("No active batch.", clrOrange); return; }
-
-   int size = ArraySize(g_Batches);
-   long magics[];
-   ArrayResize(magics, size);
-   for(int b = 0; b < size; b++)
-      magics[b] = g_Batches[b].magic;
-
-   int done = 0;
-   for(int b = 0; b < size; b++)
-      done += PartialCloseBatch(magics[b]);
-
-   SetStatus("Partial close ("+DoubleToString(PartialClosePct, 0)+"%) on "+
-             IntegerToString(done)+" positions", clrLime);
-   LogEvent("PARTIAL_CLOSE", "pct="+DoubleToString(PartialClosePct, 0)+
-            " positions="+IntegerToString(done));
   }
 
 //+------------------------------------------------------------------+
@@ -1481,12 +1447,10 @@ bool IsSuccessRetcode(uint rc)
            rc == TRADE_RETCODE_DONE_PARTIAL);
   }
 
-bool IsBusyRetcode(uint rc, int err)
+bool IsBusyRetcode(uint rc)
   {
    return (rc == TRADE_RETCODE_TOO_MANY_REQUESTS ||
-           rc == TRADE_RETCODE_LOCKED ||
-           err == TRADE_CONTEXT_BUSY ||
-           err == ERR_TRADE_CONTEXT_BUSY);
+           rc == TRADE_RETCODE_LOCKED);
   }
 
 bool IsPriceRetcode(uint rc)
@@ -1547,10 +1511,10 @@ bool IsUnderRetryCooldown(ulong ticket)
    return (now - g_RetryStates[idx].lastAttemptMs) < g_RetryStates[idx].cooldownMs;
   }
 
-int AdaptiveRetryDelayMs(int attempt, uint rc, int err)
+int AdaptiveRetryDelayMs(int attempt, uint rc)
   {
    int delay = 35 + attempt * 45;
-   if(IsBusyRetcode(rc, err))
+   if(IsBusyRetcode(rc))
       delay += 80 + attempt * 70;
    if(IsPriceRetcode(rc))
       delay += 20 + attempt * 25;
@@ -1559,11 +1523,11 @@ int AdaptiveRetryDelayMs(int attempt, uint rc, int err)
    return delay;
   }
 
-void UpdateTradePacing(uint rc, int err, bool success)
+void UpdateTradePacing(uint rc, bool success)
   {
    if(success)
       g_TradeDelayMs = (int)MathMax(TRADE_DELAY_MIN_MS, g_TradeDelayMs - 2);
-   else if(IsBusyRetcode(rc, err) || IsPriceRetcode(rc))
+   else if(IsBusyRetcode(rc) || IsPriceRetcode(rc))
       g_TradeDelayMs = (int)MathMin(TRADE_DELAY_MAX_MS, g_TradeDelayMs + 5);
   }
 
@@ -1910,9 +1874,9 @@ void LogTradeFailure(string action, uint rc, int err, string comment)
             " comment="+comment);
   }
 
-bool ShouldRetryTrade(uint rc, int err)
+bool ShouldRetryTrade(uint rc)
   {
-   return (IsBusyRetcode(rc, err) || IsPriceRetcode(rc));
+   return (IsBusyRetcode(rc) || IsPriceRetcode(rc));
   }
 
 bool SendMarketOrderSafe(int direction, double lot, double price,
@@ -1941,16 +1905,15 @@ bool SendMarketOrderSafe(int direction, double lot, double price,
          ? trade.Buy(lot, Symbol(), livePrice, liveSL, liveTP, comment)
          : trade.Sell(lot, Symbol(), livePrice, liveSL, liveTP, comment);
       rc = trade.ResultRetcode();
-      int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, err, success);
+      UpdateTradePacing(rc, success);
       if(success) return true;
 
       LogTradeFailure("ORDER_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, err, trade.ResultComment());
-      if(!ShouldRetryTrade(rc, err)) return false;
+              rc, 0, trade.ResultComment());
+      if(!ShouldRetryTrade(rc)) return false;
 
-      Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
+      Sleep(AdaptiveRetryDelayMs(attempt, rc));
      }
    return false;
   }
@@ -1966,10 +1929,16 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
       return false;
      }
 
+   if(!PositionSelectByTicket(ticket))
+     {
+      LogEvent("MOD_SKIP", context+" ticket="+IntegerToString((long)ticket)+
+               " not-found");
+      return false;
+     }
+
    int psIdx = FindPosStateIndex(ticket);
    if(psIdx >= 0)
      {
-      PositionSelectByTicket(ticket);
       string sym   = PositionGetString(POSITION_SYMBOL);
       double drift = SyncDriftThreshold(sym);
       if(g_PosStates[psIdx].sl == sl &&
@@ -2008,9 +1977,8 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
       ThrottleTradeRequest();
       bool ok = trade.PositionModify(ticket, sl, tp);
       rc = trade.ResultRetcode();
-      int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, err, success);
+      UpdateTradePacing(rc, success);
       if(success)
         {
          ClearRetryState(ticket);
@@ -2041,10 +2009,10 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
         }
 
       LogTradeFailure(context+"_MODIFY_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, err, trade.ResultComment());
-      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+                      rc, 0, trade.ResultComment());
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc);
       UpsertRetryStateOnFailure(ticket, attempt+1, baseCd);
-      if(!ShouldRetryTrade(rc, err))
+      if(!ShouldRetryTrade(rc))
         {
          LockModify(ticket);
          return false;
@@ -2067,7 +2035,7 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
            }
         }
 
-      Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
+      Sleep(AdaptiveRetryDelayMs(attempt, rc));
      }
    return false;
   }
@@ -2129,9 +2097,8 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
       bool ok = trade.PositionClose(ticket);
       g_InFlightCloses--;
       rc = trade.ResultRetcode();
-      int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, err, success);
+      UpdateTradePacing(rc, success);
       if(success)
         {
          ClearRetryState(ticket);
@@ -2139,12 +2106,12 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
         }
 
       LogTradeFailure(context+"_CLOSE_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, err, trade.ResultComment());
-      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+                      rc, 0, trade.ResultComment());
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc);
       UpsertRetryStateOnFailure(ticket, attempt+1, baseCd);
-      if(!ShouldRetryTrade(rc, err)) return false;
+      if(!ShouldRetryTrade(rc)) return false;
 
-      Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
+      Sleep(AdaptiveRetryDelayMs(attempt, rc));
      }
    return false;
   }
@@ -2200,9 +2167,8 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
       bool ok = trade.PositionClosePartial(ticket, volume);
       g_InFlightCloses--;
       rc = trade.ResultRetcode();
-      int err = GetLastError();
       bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, err, success);
+      UpdateTradePacing(rc, success);
       if(success)
         {
          ClearRetryState(ticket);
@@ -2210,12 +2176,12 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
         }
 
       LogTradeFailure(context+"_PARTIAL_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, err, trade.ResultComment());
-      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc, err);
+                      rc, 0, trade.ResultComment());
+      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc);
       UpsertRetryStateOnFailure(ticket, attempt+1, baseCd);
-      if(!ShouldRetryTrade(rc, err)) return false;
+      if(!ShouldRetryTrade(rc)) return false;
 
-      Sleep(AdaptiveRetryDelayMs(attempt, rc, err));
+      Sleep(AdaptiveRetryDelayMs(attempt, rc));
      }
    return false;
   }
@@ -2541,10 +2507,11 @@ long GenerateBatchMagic()
   {
    static long counter = 0;
    long magic = 0;
+   long salt = (long)(AccountInfoInteger(ACCOUNT_LOGIN) % 1000);
    do
-      if(ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false))
+     {
       counter++;
-      magic = MagicBase + ((long)TimeCurrent() * 1000000) + counter;
+      magic = MagicBase + (salt * 1000000000) + ((long)TimeCurrent() * 1000) + counter;
      }
    while(BatchExists(magic) || MagicInOpenPositions(magic));
    return magic;
