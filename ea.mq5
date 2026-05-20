@@ -256,12 +256,24 @@ int OnInit()
    g_IsDeinitializing = false;
    LoadPanelLayout();
 
-   if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)
-      != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
-     {
-      Alert("ApexExecution: Requires a HEDGING account. EA stopped.");
-      return INIT_FAILED;
-     }
+  //  if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)
+  //     != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+  //    {
+  //     Alert("ApexExecution: Requires a HEDGING account. EA stopped.");
+  //     return INIT_FAILED;
+  //    }
+  ENUM_ACCOUNT_MARGIN_MODE marginMode =
+   (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+
+Print("Margin mode = ", marginMode);
+
+// Only block netting accounts
+if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING ||
+   marginMode == ACCOUNT_MARGIN_MODE_EXCHANGE)
+{
+   Alert("ApexExecution: Netting account detected. Requires Hedging.");
+   return INIT_FAILED;
+}
 
    g_PanelNumTrades = NumTrades;
    g_PanelLotSize   = LotSize;
