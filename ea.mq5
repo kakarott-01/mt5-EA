@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.02"
+#property version   "4.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -104,38 +104,45 @@ struct PositionState
    datetime  lastUpdate;
   };
 
-BatchInfo g_Batches[];
+BatchInfo     g_Batches[];
 PositionState g_PosStates[];
-bool    g_IsExecuting      = false;
-bool    g_WasConnected     = true;
-bool    g_AbortFlag        = false;
-bool    g_IsDeinitializing = false;
+bool    g_IsExecuting             = false;
+bool    g_WasConnected            = true;
+bool    g_AbortFlag               = false;
+bool    g_IsDeinitializing        = false;
 bool    g_PendingReconnectResync  = false;
 bool    g_PendingReconnectRebuild = false;
-datetime g_LastRegistryRebuild  = 0;
-uint    g_ReconnectDetectedMs   = 0;
-int     g_RebuildAttempts       = 0;
-uint    g_RebuildNextAllowedMs  = 0;
-int     g_ResyncAttempts        = 0;
-uint    g_ResyncNextAllowedMs   = 0;
-bool    g_HoverBuy      = false;
-bool    g_HoverSell     = false;
-int     g_SelectedBatchIndex = -1;
-int     g_PanelNumTrades = 0;
-double  g_PanelLotSize   = 0;
-double  g_PanelSL        = 0;
-double  g_PanelTP        = 0;
-uint    g_LastTradeActionMs = 0;
-int     g_TradeDelayMs   = 10;
+datetime g_LastRegistryRebuild   = 0;
+uint    g_ReconnectDetectedMs    = 0;
+int     g_RebuildAttempts        = 0;
+uint    g_RebuildNextAllowedMs   = 0;
+int     g_ResyncAttempts         = 0;
+uint    g_ResyncNextAllowedMs    = 0;
+bool    g_HoverBuy               = false;
+bool    g_HoverSell              = false;
+int     g_SelectedBatchIndex     = -1;
+int     g_PanelNumTrades         = 0;
+double  g_PanelLotSize           = 0;
+double  g_PanelSL                = 0;
+double  g_PanelTP                = 0;
+uint    g_LastTradeActionMs      = 0;
+int     g_TradeDelayMs           = 10;
+
+// Phase 8: integrity check timestamp
+uint    g_LastIntegrityCheckMs   = 0;
 
 const int TRADE_DELAY_MIN_MS = 10;
 const int TRADE_DELAY_MAX_MS = 25;
 const int TRADE_RETRY_MAX    = 4;
 const int MODIFY_COOLDOWN_MS = 200;
 
-// FIX 4: State-dependent exec-state timeouts
-const int EXEC_STATE_TIMEOUT_MS     = 10000;  // 10 s  — all states except executing
-const int EXEC_EXECUTING_TIMEOUT_MS = 120000; // 2 min — execution loop (200 trades max)
+// State-dependent exec-state timeouts
+const int EXEC_STATE_TIMEOUT_MS      = 10000;  // 10 s  — general management states
+const int EXEC_EXECUTING_TIMEOUT_MS  = 120000; // 2 min — order fill loop (200 trades max)
+const int EXEC_MODIFYING_TIMEOUT_MS  = 30000;  // 30 s  — modify queue dispatch
+
+// Phase 8: integrity check interval
+const int INTEGRITY_CHECK_INTERVAL_MS = 60000; // 1 min
 
 struct ModifyLock
   {
@@ -145,8 +152,12 @@ struct ModifyLock
 
 ModifyLock g_ModifyLocks[];
 
+// EXEC_MODIFYING (7) added in Phase 8: distinguishes modify-queue dispatch from
+// the execution fill loop, prevents false DIAG_WARN "state held EXECUTING" noise
+// that fired at 3 s during heavy trailing runs, and uses a correct 30-s timeout.
 enum EXEC_STATE { EXEC_IDLE=0, EXEC_EXECUTING=1, EXEC_SYNCING=2, EXEC_TRAILING=3,
-                  EXEC_CLOSING=4, EXEC_RECOVERING=5, EXEC_REBUILDING=6 };
+                  EXEC_CLOSING=4, EXEC_RECOVERING=5, EXEC_REBUILDING=6,
+                  EXEC_MODIFYING=7 };
 int    g_ExecState        = EXEC_IDLE;
 uint   g_ExecStateStartMs = 0;
 uint   g_LastTimerMs      = 0;
@@ -168,7 +179,7 @@ int g_ModifyQueuedCount  = 0;
 int g_ModifySuccessCount = 0;
 int g_ModifyFailCount    = 0;
 
-uint g_LastDiagMs    = 0;
+uint g_LastDiagMs       = 0;
 int  g_TimerSkipCount   = 0;
 int  g_SyncSkipCount    = 0;
 int  g_TrailSkipCount   = 0;
@@ -187,12 +198,12 @@ struct RetryState
 RetryState g_RetryStates[];
 const int RETRY_ESCALATION_FACTOR = 4;
 
-// FIX: Raised from 120 to 360 to match capacity=6 throughput.
-// At capacity=6 and 100ms timer, max throughput = 6 * 600 = 3600/min.
-// 120 was calibrated for the old capacity=2 (120/min exact match).
-// With capacity=6, 120 was saturated in ~2 seconds of sustained trailing,
-// blocking ~80 of 200 trailing positions for the remaining 58 seconds.
-// 360 = 6 per tick * 600 ticks/min — matches actual processing capacity.
+// Rate limit raised from 120 to 360 to match capacity=6 throughput (Fix 2).
+// At capacity=6 and 100ms timer: max throughput = 6 * 600 = 3600/min.
+// 120 was calibrated for old capacity=2 (120/min exact match).
+// With capacity=6, 120 saturated in ~2 seconds of trailing, leaving ~80 of
+// 200 trailing positions un-updated for 58 seconds per minute.
+// 360 matches actual processing capacity (6/tick * 600 ticks/min).
 const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 360;
 const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
 int g_InFlightModifies = 0;
@@ -203,22 +214,22 @@ int g_InFlightCloses   = 0;
 //+------------------------------------------------------------------+
 //| PANEL CONSTANTS                                                   |
 //+------------------------------------------------------------------+
-const string P            = "MOE_";
+const string P              = "MOE_";
 const string SL_PLACEHOLDER = "50";
 const string TP_PLACEHOLDER = "100";
-const int    PR           = 36;
-const int    PT           = 45;
-const int    PW           = 400;
-const int    PH           = 700;
-const int    PH_MIN       = 70;
-const int    BUY_X        = 16;
-const int    BUY_Y        = 366;
-const int    BUY_W        = 176;
-const int    BUY_H        = 42;
-const int    SELL_X       = 208;
-const int    SELL_Y       = 366;
-const int    SELL_W       = 176;
-const int    SELL_H       = 42;
+const int    PR             = 36;
+const int    PT             = 45;
+const int    PW             = 400;
+const int    PH             = 700;
+const int    PH_MIN         = 70;
+const int    BUY_X          = 16;
+const int    BUY_Y          = 366;
+const int    BUY_W          = 176;
+const int    BUY_H          = 42;
+const int    SELL_X         = 208;
+const int    SELL_Y         = 366;
+const int    SELL_W         = 176;
+const int    SELL_H         = 42;
 
 const color  CLR_BG          = C'14,16,22';
 const color  CLR_SURFACE     = C'22,25,34';
@@ -256,24 +267,17 @@ int OnInit()
    g_IsDeinitializing = false;
    LoadPanelLayout();
 
-  //  if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)
-  //     != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
-  //    {
-  //     Alert("ApexExecution: Requires a HEDGING account. EA stopped.");
-  //     return INIT_FAILED;
-  //    }
-  ENUM_ACCOUNT_MARGIN_MODE marginMode =
-   (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   ENUM_ACCOUNT_MARGIN_MODE marginMode =
+      (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   Print("Margin mode = ", marginMode);
 
-Print("Margin mode = ", marginMode);
-
-// Only block netting accounts
-if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING ||
-   marginMode == ACCOUNT_MARGIN_MODE_EXCHANGE)
-{
-   Alert("ApexExecution: Netting account detected. Requires Hedging.");
-   return INIT_FAILED;
-}
+   // Only block netting accounts
+   if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING ||
+      marginMode == ACCOUNT_MARGIN_MODE_EXCHANGE)
+     {
+      Alert("ApexExecution: Netting account detected. Requires Hedging.");
+      return INIT_FAILED;
+     }
 
    g_PanelNumTrades = NumTrades;
    g_PanelLotSize   = LotSize;
@@ -392,12 +396,14 @@ void OnTimer()
                   g_RebuildSkipCount++;
                   if(g_RebuildAttempts >= RebuildMaxAttempts)
                     {
-                     g_RebuildNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * RebuildMaxAttempts);
+                     g_RebuildNextAllowedMs = nowMs +
+                        (uint)(RebuildBackoffMs * RebuildMaxAttempts);
                      LogEvent("RECONNECT", "Rebuild deferred (max attempts)");
                     }
                   else
                     {
-                     g_RebuildNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * MathMax(1, g_RebuildAttempts));
+                     g_RebuildNextAllowedMs = nowMs +
+                        (uint)(RebuildBackoffMs * MathMax(1, g_RebuildAttempts));
                      LogEvent("RECONNECT", "Skipped rebuild due to exec lock");
                     }
                  }
@@ -409,7 +415,8 @@ void OnTimer()
               }
            }
 
-         if(g_PendingReconnectResync && !g_PendingReconnectRebuild && nowMs >= g_ResyncNextAllowedMs)
+         if(g_PendingReconnectResync && !g_PendingReconnectRebuild &&
+            nowMs >= g_ResyncNextAllowedMs)
            {
             LogEvent("RECONNECT", "Processing queued resync");
             if(AcquireExecState(EXEC_SYNCING))
@@ -425,12 +432,14 @@ void OnTimer()
                g_SyncSkipCount++;
                if(g_ResyncAttempts >= RebuildMaxAttempts)
                  {
-                  g_ResyncNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * RebuildMaxAttempts);
+                  g_ResyncNextAllowedMs = nowMs +
+                     (uint)(RebuildBackoffMs * RebuildMaxAttempts);
                   LogEvent("RECONNECT", "Resync deferred (max attempts)");
                  }
                else
                  {
-                  g_ResyncNextAllowedMs = nowMs + (uint)(RebuildBackoffMs * MathMax(1, g_ResyncAttempts));
+                  g_ResyncNextAllowedMs = nowMs +
+                     (uint)(RebuildBackoffMs * MathMax(1, g_ResyncAttempts));
                   LogEvent("RECONNECT", "Skipped resync due to exec lock");
                  }
               }
@@ -438,13 +447,16 @@ void OnTimer()
         }
      }
 
-   //--- Drop closed batches before any management pass
+   //--- Drop closed batches; Phase 8: also purge zombie retry/lock entries
    if(connected)
      {
       if(AcquireExecState(EXEC_RECOVERING))
         {
          CleanupOrphanBatches();
          CleanupPosStates();
+         CleanupRetryStates();   // Phase 8: remove retry entries for closed positions
+         CleanupModifyLocks();   // Phase 8: remove modify locks for closed positions
+         IntegrityCheck();       // Phase 8: periodic batch/state integrity logging
          ReleaseExecState(EXEC_RECOVERING);
         }
      }
@@ -469,7 +481,8 @@ void OnTimer()
      }
 
    //--- Trailing stop
-   if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 && connected && !syncDidWork && !g_IsExecuting)
+   if(TrailingStop > 0.0 && ArraySize(g_Batches) > 0 &&
+      connected && !syncDidWork && !g_IsExecuting)
      {
       if(AcquireExecState(EXEC_TRAILING))
         {
@@ -483,13 +496,15 @@ void OnTimer()
         }
      }
 
-   //--- Process queued modify requests (throttled)
+   //--- Process queued modify requests (throttled).
+   //    Uses EXEC_MODIFYING (not EXEC_EXECUTING) so DiagnosticsTick can
+   //    correctly distinguish queue dispatch from the order fill loop.
    if(connected && !g_IsExecuting)
      {
-      if(AcquireExecState(EXEC_EXECUTING))
+      if(AcquireExecState(EXEC_MODIFYING))
         {
          ProcessModifyQueue();
-         ReleaseExecState(EXEC_EXECUTING);
+         ReleaseExecState(EXEC_MODIFYING);
         }
       else
         {
@@ -708,7 +723,8 @@ void ExecuteOrders(int direction)
         {
          SetStatus("Spread "+DoubleToString(spd, 1)+" > "+
                    DoubleToString(MaxSpread, 1)+" pips. Aborted.", clrOrange);
-         UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+         UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+         return;
         }
      }
 
@@ -718,7 +734,8 @@ void ExecuteOrders(int direction)
    if(slots <= 0)
      {
       SetStatus("At 200-position limit. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+      return;
      }
    int numToOpen = g_PanelNumTrades;
    if(numToOpen > slots)
@@ -749,7 +766,8 @@ void ExecuteOrders(int direction)
    if(lot <= 0.0)
      {
       SetStatus("Invalid lot (symbol info unavailable).", clrOrange);
-      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+      return;
      }
 
    //--- 4. MARGIN CHECK
@@ -758,16 +776,19 @@ void ExecuteOrders(int direction)
    double priceForCheck  = (direction == 0)
       ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
       : SymbolInfoDouble(Symbol(), SYMBOL_BID);
-   if(!OrderCalcMargin(oType, Symbol(), lot, priceForCheck, marginPer) || marginPer <= 0.0)
+   if(!OrderCalcMargin(oType, Symbol(), lot, priceForCheck, marginPer) ||
+      marginPer <= 0.0)
      {
       SetStatus("Margin check failed. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+      return;
      }
    double required = marginPer * numToOpen * 1.2;
    if(AccountInfoDouble(ACCOUNT_MARGIN_FREE) < required)
      {
       SetStatus("Insufficient margin. Need $"+DoubleToString(required, 2), clrOrange);
-      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+      return;
      }
 
    //--- 5. GENERATE BATCH ID
@@ -795,7 +816,8 @@ void ExecuteOrders(int direction)
    if(!AddBatch(batch))
      {
       SetStatus("Batch registry failed. Aborted.", clrOrange);
-      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING); return;
+      UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
+      return;
      }
    g_SelectedBatchIndex = FindBatchIndex(batchID);
    LogEvent("BATCH_CREATE", "magic="+IntegerToString(batchID)+
@@ -860,7 +882,8 @@ void ExecuteOrders(int direction)
 
       uint rc = 0;
       // NOTE: SL/TP are sent at order time; PostFillAttachSLTP is a safety net.
-      bool sent = SendMarketOrderSafe(direction, lot, price, sl_price, tp_price, cmt, rc);
+      bool sent = SendMarketOrderSafe(direction, lot, price,
+                                     sl_price, tp_price, cmt, rc);
 
       if(sent)
         {
@@ -922,12 +945,11 @@ void ExecuteOrders(int direction)
 //+------------------------------------------------------------------+
 //| PostFillAttachSLTP — safety net for market execution mode        |
 //|                                                                   |
-//| FIX: Removed premature UpsertPosState and UpdateBatchStops calls |
-//| after EnqueueModifyRequest (blocking=false). Those calls updated  |
-//| PosState and batch.sl/tp before broker confirmation, which caused |
-//| BackupSyncCheck to skip repair for positions that hadn't yet had  |
-//| their SL/TP confirmed. ModifyPositionSafe's success path already  |
-//| handles UpsertPosState and UpdateBatchStops on confirmed modify.  |
+//| Enqueues only — does NOT call UpsertPosState or UpdateBatchStops |
+//| here. Those updates fired on enqueue (pre-confirmation) and      |
+//| caused BackupSyncCheck to see target SL in PosState while the    |
+//| broker still had SL=0, actively suppressing needed repair.       |
+//| ModifyPositionSafe's confirmed success path handles both updates. |
 //+------------------------------------------------------------------+
 void PostFillAttachSLTP(long batchID, int direction)
   {
@@ -973,10 +995,8 @@ void PostFillAttachSLTP(long batchID, int direction)
       newTP = EnforceStopsLevel(posSymbol, openPx, newTP, direction, true);
 
       uint rc = 0;
-      // Enqueue only — do NOT call UpsertPosState or UpdateBatchStops here.
-      // ModifyPositionSafe's confirmed success path handles both updates.
-      // Premature state updates before broker confirmation caused
-      // BackupSyncCheck to suppress repair for unconfirmed positions.
+      // Enqueue only — ModifyPositionSafe's confirmed success path handles
+      // UpsertPosState and UpdateBatchStops on broker confirmation.
       ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "POST_ATTACH", false);
      }
 
@@ -1019,7 +1039,8 @@ void SyncAllPositions(long magic, double newSL, double newTP)
          uint rc = 0;
          double applySL = slImprove ? newSL : curSL;
          double applyTP = tpImprove ? newTP : curTP;
-         if(ModifyPositionQueued(posInfo.Ticket(), applySL, applyTP, rc, "SYNC", false))
+         if(ModifyPositionQueued(posInfo.Ticket(), applySL, applyTP,
+                                 rc, "SYNC", false))
             synced++;
         }
      }
@@ -1195,7 +1216,8 @@ bool CloseAllBatch(long magic)
       if(!AcquireExecState(EXEC_CLOSING))
         {
          SetStatus("Close already in progress.", clrOrange);
-         LogEvent("CLOSE_SKIP", "cannot acquire closing lock for batch="+IntegerToString(magic));
+         LogEvent("CLOSE_SKIP", "cannot acquire closing lock for batch="+
+                  IntegerToString(magic));
          g_CloseSkipCount++;
          return false;
         }
@@ -1230,7 +1252,8 @@ bool CloseAllBatch(long magic)
       SaveLatestBatchGlobals();
      }
 
-   string msg = "Closed "+IntegerToString(closed)+" from batch "+IntegerToString(magic);
+   string msg = "Closed "+IntegerToString(closed)+" from batch "+
+                IntegerToString(magic);
    if(failed > 0) msg += " | Failed: "+IntegerToString(failed);
    SetStatus(msg, (failed == 0) ? clrLime : clrOrange);
    LogEvent("CLOSE", msg);
@@ -1278,7 +1301,8 @@ int BreakevenBatch(long magic)
          if(SymbolInfoDouble(batchSymbol, SYMBOL_BID) >= triggerPx && curSL < beSL)
            {
             uint rc = 0;
-            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN", false))
+            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP,
+                                    rc, "BREAKEVEN", false))
                done++;
            }
         }
@@ -1293,7 +1317,8 @@ int BreakevenBatch(long magic)
             && (curSL > beSL || curSL == 0.0))
            {
             uint rc = 0;
-            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP, rc, "BREAKEVEN", false))
+            if(ModifyPositionQueued(posInfo.Ticket(), beSL, curTP,
+                                    rc, "BREAKEVEN", false))
                done++;
            }
         }
@@ -1330,7 +1355,6 @@ int PartialCloseBatch(long magic)
    double vStep = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_STEP);
    double vMin  = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_MIN);
 
-   // FIX 1: Release exec-state before this early return.
    if(vStep <= 0.0 || vMin <= 0.0)
      {
       LogEvent("EXEC_FAIL", "Invalid volume settings for "+batchSymbol+
@@ -1418,7 +1442,8 @@ void ProcessTrailingBatch(long magic)
          if(curSL == 0.0 || newTrail > curSL + trailStep)
            {
             uint rc = 0;
-            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING", false))
+            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP,
+                                    rc, "TRAILING", false))
                modified = true;
            }
         }
@@ -1430,7 +1455,8 @@ void ProcessTrailingBatch(long magic)
          if(curSL == 0.0 || newTrail < curSL - trailStep)
            {
             uint rc = 0;
-            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP, rc, "TRAILING", false))
+            if(ModifyPositionQueued(posInfo.Ticket(), newTrail, curTP,
+                                    rc, "TRAILING", false))
                modified = true;
            }
         }
@@ -1513,7 +1539,8 @@ void UpsertRetryStateOnFailure(ulong ticket, int attempt, uint baseCooldown)
       g_RetryStates[idx].attempts      = attempt;
       g_RetryStates[idx].lastAttemptMs = now;
       if(attempt >= TRADE_RETRY_MAX)
-         g_RetryStates[idx].cooldownMs = (uint)(g_RetryStates[idx].cooldownMs * RETRY_ESCALATION_FACTOR);
+         g_RetryStates[idx].cooldownMs =
+            (uint)(g_RetryStates[idx].cooldownMs * RETRY_ESCALATION_FACTOR);
       else
          g_RetryStates[idx].cooldownMs = baseCooldown;
      }
@@ -1530,12 +1557,9 @@ bool IsUnderRetryCooldown(ulong ticket)
 int AdaptiveRetryDelayMs(int attempt, uint rc)
   {
    int delay = 35 + attempt * 45;
-   if(IsBusyRetcode(rc))
-      delay += 80 + attempt * 70;
-   if(IsPriceRetcode(rc))
-      delay += 20 + attempt * 25;
-   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
-      delay += 250;
+   if(IsBusyRetcode(rc))  delay += 80 + attempt * 70;
+   if(IsPriceRetcode(rc)) delay += 20 + attempt * 25;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED)) delay += 250;
    return delay;
   }
 
@@ -1561,24 +1585,23 @@ bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
    uint now = GetTickCount();
    if(idx >= 0)
      {
-      g_ModifyQueue[idx].sl             = sl;
-      g_ModifyQueue[idx].tp             = tp;
-      g_ModifyQueue[idx].context        = context;
-      g_ModifyQueue[idx].requestedAtMs  = now;
+      g_ModifyQueue[idx].sl            = sl;
+      g_ModifyQueue[idx].tp            = tp;
+      g_ModifyQueue[idx].context       = context;
+      g_ModifyQueue[idx].requestedAtMs = now;
       return true;
      }
 
    ModifyRequest req;
-   req.ticket         = ticket;
-   req.sl             = sl;
-   req.tp             = tp;
-   req.context        = context;
-   req.rc             = 0;
-   req.status         = 0;
-   req.requestedAtMs  = now;
+   req.ticket        = ticket;
+   req.sl            = sl;
+   req.tp            = tp;
+   req.context       = context;
+   req.rc            = 0;
+   req.status        = 0;
+   req.requestedAtMs = now;
    int s = ArraySize(g_ModifyQueue);
-   if(ArrayResize(g_ModifyQueue, s+1) != s+1)
-      return false;
+   if(ArrayResize(g_ModifyQueue, s+1) != s+1) return false;
    g_ModifyQueue[s] = req;
    g_ModifyQueuedCount++;
    return true;
@@ -1609,12 +1632,13 @@ void RemoveModifyQueueItem(int index, bool &skipped[])
 //+------------------------------------------------------------------+
 //| ProcessModifyQueue — throttled modify worker                     |
 //|                                                                   |
-//| FIX 2: Rewritten as while loop with skipped[] sentinel.          |
-//| FIX 3: modifyCount incremented ONLY on successful modify.        |
+//| capacity=6: max successful modifies dispatched per timer tick.   |
+//| Uses skipped[] sentinel to find oldest non-blocked request.      |
+//| modifyCount incremented ONLY on successful modify.               |
 //+------------------------------------------------------------------+
 void ProcessModifyQueue()
   {
-   const int capacity = 6; // max successful modifies dispatched per timer tick
+   const int capacity = 6;
    int processed = 0;
    if(ArraySize(g_ModifyQueue) == 0) return;
 
@@ -1694,7 +1718,6 @@ void ProcessModifyQueue()
       if(ok)
         {
          g_ModifySuccessCount++;
-         // FIX 3: Only count against rate limit on success.
          if(bidx >= 0) g_Batches[bidx].modifyCount++;
         }
       else
@@ -1733,15 +1756,35 @@ bool AcquireExecState(int desired)
    return true;
   }
 
+//+------------------------------------------------------------------+
+//| ReleaseExecState                                                  |
+//|                                                                   |
+//| Phase 8: split timeout by state (EXECUTING=2min, MODIFYING=30s, |
+//| others=10s). Added force-release logging so stuck states are     |
+//| visible in the diagnostics log without waiting for DiagWarn.     |
+//+------------------------------------------------------------------+
 void ReleaseExecState(int expected)
   {
    uint now = GetTickCount();
-   uint timeout = (g_ExecState == EXEC_EXECUTING)
-                  ? (uint)EXEC_EXECUTING_TIMEOUT_MS
-                  : (uint)EXEC_STATE_TIMEOUT_MS;
-   if(g_ExecState == expected ||
-      (g_ExecStateStartMs > 0 && now - g_ExecStateStartMs > timeout))
+   uint timeout;
+   if(g_ExecState == EXEC_EXECUTING)
+      timeout = (uint)EXEC_EXECUTING_TIMEOUT_MS;
+   else if(g_ExecState == EXEC_MODIFYING)
+      timeout = (uint)EXEC_MODIFYING_TIMEOUT_MS;
+   else
+      timeout = (uint)EXEC_STATE_TIMEOUT_MS;
+
+   if(g_ExecState == expected)
      {
+      g_ExecState        = EXEC_IDLE;
+      g_ExecStateStartMs = 0;
+     }
+   else if(g_ExecStateStartMs > 0 && now - g_ExecStateStartMs > timeout)
+     {
+      LogEvent("EXEC_FORCE_RELEASE",
+               "state="+ExecStateText(g_ExecState)+
+               " expected="+ExecStateText(expected)+
+               " held="+IntegerToString((int)(now - g_ExecStateStartMs))+"ms");
       g_ExecState        = EXEC_IDLE;
       g_ExecStateStartMs = 0;
      }
@@ -1749,15 +1792,22 @@ void ReleaseExecState(int expected)
 
 string ExecStateText(int state)
   {
-   if(state == EXEC_EXECUTING) return "EXECUTING";
-   if(state == EXEC_SYNCING)   return "SYNCING";
-   if(state == EXEC_TRAILING)  return "TRAILING";
-   if(state == EXEC_CLOSING)   return "CLOSING";
-   if(state == EXEC_RECOVERING)return "RECOVERING";
-   if(state == EXEC_REBUILDING)return "REBUILDING";
+   if(state == EXEC_EXECUTING)  return "EXECUTING";
+   if(state == EXEC_SYNCING)    return "SYNCING";
+   if(state == EXEC_TRAILING)   return "TRAILING";
+   if(state == EXEC_CLOSING)    return "CLOSING";
+   if(state == EXEC_RECOVERING) return "RECOVERING";
+   if(state == EXEC_REBUILDING) return "REBUILDING";
+   if(state == EXEC_MODIFYING)  return "MODIFYING";
    return "IDLE";
   }
 
+//+------------------------------------------------------------------+
+//| DiagnosticsTick                                                   |
+//|                                                                   |
+//| Phase 8: added batches, managed position count, retry state      |
+//| count and modify lock count for better live observability.       |
+//+------------------------------------------------------------------+
 void DiagnosticsTick()
   {
    if(!EnableDiagnostics) return;
@@ -1766,12 +1816,21 @@ void DiagnosticsTick()
       return;
 
    g_LastDiagMs = now;
-   int qsize = ArraySize(g_ModifyQueue);
+   int qsize    = ArraySize(g_ModifyQueue);
+   int batchCnt = ArraySize(g_Batches);
+   int retryCnt = ArraySize(g_RetryStates);
+   int lockCnt  = ArraySize(g_ModifyLocks);
+   int posCnt   = PositionsTotal();
    string state = ExecStateText(g_ExecState);
+
    LogEvent("DIAG", "state="+state+
+            " batches="+IntegerToString(batchCnt)+
+            " pos="+IntegerToString(posCnt)+
             " q="+IntegerToString(qsize)+
             " inflightM="+IntegerToString(g_InFlightModifies)+
             " inflightC="+IntegerToString(g_InFlightCloses)+
+            " retryStates="+IntegerToString(retryCnt)+
+            " locks="+IntegerToString(lockCnt)+
             " modOk="+IntegerToString(g_ModifySuccessCount)+
             " modFail="+IntegerToString(g_ModifyFailCount)+
             " tSkip="+IntegerToString(g_TimerSkipCount)+
@@ -1826,8 +1885,8 @@ void LockModify(ulong ticket)
    uint now = GetTickCount();
    int idx  = FindModifyLockIndex(ticket);
    ModifyLock ml;
-   ml.ticket      = ticket;
-   ml.unlockAtMs  = now + MODIFY_COOLDOWN_MS;
+   ml.ticket     = ticket;
+   ml.unlockAtMs = now + MODIFY_COOLDOWN_MS;
    if(idx >= 0)
       g_ModifyLocks[idx] = ml;
    else
@@ -1895,7 +1954,7 @@ bool SendMarketOrderSafe(int direction, double lot, double price,
       if(success) return true;
 
       LogTradeFailure("ORDER_ATTEMPT_"+IntegerToString(attempt+1),
-              rc, 0, trade.ResultComment());
+                      rc, 0, trade.ResultComment());
       if(!ShouldRetryTrade(rc)) return false;
 
       Sleep(AdaptiveRetryDelayMs(attempt, rc));
@@ -1938,7 +1997,8 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
    if(IsModifyLocked(ticket))
      {
       rc = TRADE_RETCODE_LOCKED;
-      LogEvent("MOD_LOCK", context+" ticket="+IntegerToString((long)ticket)+" locked");
+      LogEvent("MOD_LOCK", context+" ticket="+IntegerToString((long)ticket)+
+               " locked");
       return false;
      }
 
@@ -1972,7 +2032,8 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
            {
             long magic = (long)PositionGetInteger(POSITION_MAGIC);
             string sym = PositionGetString(POSITION_SYMBOL);
-            int dir    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 0 : 1;
+            int dir    = (PositionGetInteger(POSITION_TYPE) ==
+                          POSITION_TYPE_BUY) ? 0 : 1;
             UpsertPosState(ticket, magic, sym, dir, sl, tp);
             int bidx = FindBatchIndex(magic);
             if(bidx >= 0)
@@ -2031,7 +2092,8 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
    if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
      {
       rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
+      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+
+               IntegerToString((long)ticket));
       return false;
      }
 
@@ -2053,7 +2115,8 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
       if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
         {
          rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
+         LogEvent("FLOOD_CLOSE_BATCH", "batch="+
+                  IntegerToString(g_Batches[bidx].magic));
          return false;
         }
       g_Batches[bidx].closeCount++;
@@ -2062,7 +2125,8 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
    if(IsUnderRetryCooldown(ticket))
      {
       rc = TRADE_RETCODE_LOCKED;
-      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+
+               IntegerToString((long)ticket));
       return false;
      }
 
@@ -2102,9 +2166,9 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
 //+------------------------------------------------------------------+
 //| ClosePositionPartialSafe                                          |
 //|                                                                   |
-//| FIX: Added IsUnderRetryCooldown check to match ClosePositionSafe.|
-//| Previously missing, allowing cooling-down tickets to be hammered  |
-//| by partial close retries without per-ticket cooldown enforcement. |
+//| IsUnderRetryCooldown check added (Fix 4) to match               |
+//| ClosePositionSafe. Placed before close-count accounting so a     |
+//| cooling-down ticket never consumes a closeCount slot.            |
 //+------------------------------------------------------------------+
 bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
                               string context)
@@ -2115,15 +2179,16 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
    if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
      {
       rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
+      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+
+               IntegerToString((long)ticket));
       return false;
      }
 
-   // FIX Priority 4: Added retry cooldown check — consistent with ClosePositionSafe.
    if(IsUnderRetryCooldown(ticket))
      {
       rc = TRADE_RETCODE_LOCKED;
-      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+
+               IntegerToString((long)ticket));
       return false;
      }
 
@@ -2145,7 +2210,8 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
       if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
         {
          rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
+         LogEvent("FLOOD_CLOSE_BATCH", "batch="+
+                  IntegerToString(g_Batches[bidx].magic));
          return false;
         }
       g_Batches[bidx].closeCount++;
@@ -2290,6 +2356,96 @@ void CleanupPosStates()
          RemovePosStateAt(i);
   }
 
+//+------------------------------------------------------------------+
+//| CleanupRetryStates — Phase 8                                      |
+//|                                                                   |
+//| Removes retry state entries for positions that are no longer     |
+//| open. Called from the EXEC_RECOVERING block on every timer tick. |
+//| Prevents unbounded growth of g_RetryStates[] when positions      |
+//| close while under retry cooldown (zombie entries that ClearRetry |
+//| never fires on because the success path is never reached).       |
+//+------------------------------------------------------------------+
+void CleanupRetryStates()
+  {
+   for(int i = ArraySize(g_RetryStates)-1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_RetryStates[i].ticket))
+        {
+         int sz = ArraySize(g_RetryStates);
+         for(int j = i; j < sz-1; j++)
+            g_RetryStates[j] = g_RetryStates[j+1];
+         ArrayResize(g_RetryStates, sz-1);
+        }
+  }
+
+//+------------------------------------------------------------------+
+//| CleanupModifyLocks — Phase 8                                      |
+//|                                                                   |
+//| Removes modify lock entries for positions that no longer exist.  |
+//| IsModifyLocked() already cleans expired locks by time inline;    |
+//| this function adds position-existence cleanup so locks for        |
+//| closed positions don't occupy slots if the ticket is re-used     |
+//| on a future position (edge case on some brokers).                |
+//+------------------------------------------------------------------+
+void CleanupModifyLocks()
+  {
+   for(int i = ArraySize(g_ModifyLocks)-1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_ModifyLocks[i].ticket))
+        {
+         int sz = ArraySize(g_ModifyLocks);
+         for(int j = i; j < sz-1; j++)
+            g_ModifyLocks[j] = g_ModifyLocks[j+1];
+         ArrayResize(g_ModifyLocks, sz-1);
+        }
+  }
+
+//+------------------------------------------------------------------+
+//| IntegrityCheck — Phase 8                                          |
+//|                                                                   |
+//| Read-only periodic check (every 60 seconds) that logs any        |
+//| discrepancy between the batch registry and live positions.       |
+//| Does not repair; repair is handled by CleanupOrphanBatches and   |
+//| BackupSyncCheck. Provides an early warning signal for silent     |
+//| desynchronization under long VPS runtimes.                       |
+//+------------------------------------------------------------------+
+void IntegrityCheck()
+  {
+   uint now = GetTickCount();
+   if(g_LastIntegrityCheckMs > 0 &&
+      now - g_LastIntegrityCheckMs < (uint)INTEGRITY_CHECK_INTERVAL_MS)
+      return;
+   g_LastIntegrityCheckMs = now;
+
+   // Check each batch has live positions; note fill-count drift
+   for(int b = 0; b < ArraySize(g_Batches); b++)
+     {
+      int cnt = CountBatchPositions(g_Batches[b].magic, g_Batches[b].symbol);
+      if(cnt == 0)
+         LogEvent("INTEGRITY_WARN", "orphan batch="+
+                  IntegerToString(g_Batches[b].magic)+
+                  " recorded_fill="+IntegerToString(g_Batches[b].filled)+
+                  " live=0");
+      else if(cnt != g_Batches[b].filled)
+         LogEvent("INTEGRITY_INFO", "batch="+
+                  IntegerToString(g_Batches[b].magic)+
+                  " recorded_fill="+IntegerToString(g_Batches[b].filled)+
+                  " live="+IntegerToString(cnt));
+     }
+
+   // Check PosState count vs managed live positions
+   int managedPosCount = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(FindBatchIndex((long)posInfo.Magic()) >= 0)
+         managedPosCount++;
+     }
+   int stateCount = ArraySize(g_PosStates);
+   if(managedPosCount != stateCount)
+      LogEvent("INTEGRITY_INFO", "managed_pos="+IntegerToString(managedPosCount)+
+               " pos_states="+IntegerToString(stateCount)+
+               " delta="+IntegerToString(managedPosCount - stateCount));
+  }
+
 bool IsOurBatchMagic(long magic, string comment)
   {
    string key = "MOE_KNOWN_"+IntegerToString(magic);
@@ -2313,8 +2469,8 @@ void RebuildBatchRegistryFromPositions()
       string comment = PositionGetString(POSITION_COMMENT);
       if(!IsOurBatchMagic(magic, comment)) continue;
 
-      int posDir     = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 0 : 1;
-      int batchIndex = FindBatchIndex(magic);
+      int posDir      = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 0 : 1;
+      int batchIndex  = FindBatchIndex(magic);
       datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
 
       UpsertPosState(posInfo.Ticket(), magic, posInfo.Symbol(), posDir,
@@ -2405,8 +2561,8 @@ void ResyncAllBatches()
       string batchSymbol = g_Batches[batchIndex].symbol;
       if(posInfo.Symbol() != batchSymbol) continue;
 
-      ulong ticket   = posInfo.Ticket();
-      int stateIdx   = FindPosStateIndex(ticket);
+      ulong ticket  = posInfo.Ticket();
+      int stateIdx  = FindPosStateIndex(ticket);
       if(stateIdx < 0)
         {
          UpsertPosState(ticket, magic, batchSymbol,
@@ -2509,7 +2665,8 @@ long GenerateBatchMagic()
    do
      {
       counter++;
-      magic = MagicBase + (salt * 1000000000) + ((long)TimeCurrent() * 1000) + counter;
+      magic = MagicBase + (salt * 1000000000) +
+              ((long)TimeCurrent() * 1000) + counter;
      }
    while(BatchExists(magic) || MagicInOpenPositions(magic));
    return magic;
@@ -2573,26 +2730,26 @@ double NormalizeLot(double lot)
 bool IsFrozen(ulong ticket, double newSL, double newTP)
   {
    if(!PositionSelectByTicket(ticket)) return false;
-   string symbol    = PositionGetString(POSITION_SYMBOL);
-   long freezeLvl   = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   string symbol   = PositionGetString(POSITION_SYMBOL);
+   long freezeLvl  = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    if(freezeLvl <= 0) return false;
-   double point     = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double minDist   = freezeLvl * point;
-   int posType      = (int)PositionGetInteger(POSITION_TYPE);
-   double price     = (posType == POSITION_TYPE_BUY)
-                      ? SymbolInfoDouble(symbol, SYMBOL_BID)
-                      : SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double posSL     = PositionGetDouble(POSITION_SL);
-   double posTP     = PositionGetDouble(POSITION_TP);
-   bool slFrozen    = ((posSL > 0.0 && MathAbs(price - posSL) < minDist) ||
-                       (newSL > 0.0 && MathAbs(price - newSL) < minDist));
-   bool tpFrozen    = ((posTP > 0.0 && MathAbs(price - posTP) < minDist) ||
-                       (newTP > 0.0 && MathAbs(price - newTP) < minDist));
+   double point    = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double minDist  = freezeLvl * point;
+   int posType     = (int)PositionGetInteger(POSITION_TYPE);
+   double price    = (posType == POSITION_TYPE_BUY)
+                     ? SymbolInfoDouble(symbol, SYMBOL_BID)
+                     : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double posSL    = PositionGetDouble(POSITION_SL);
+   double posTP    = PositionGetDouble(POSITION_TP);
+   bool slFrozen   = ((posSL > 0.0 && MathAbs(price - posSL) < minDist) ||
+                      (newSL > 0.0 && MathAbs(price - newSL) < minDist));
+   bool tpFrozen   = ((posTP > 0.0 && MathAbs(price - posTP) < minDist) ||
+                      (newTP > 0.0 && MathAbs(price - newTP) < minDist));
    return (slFrozen || tpFrozen);
   }
 
-double EnforceStopsLevel(string symbol, double price, double level, int dir,
-                         bool isTP)
+double EnforceStopsLevel(string symbol, double price, double level,
+                         int dir, bool isTP)
   {
    if(level == 0.0) return 0.0;
    int stopsLvl = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
@@ -2613,11 +2770,9 @@ double EnforceStopsLevel(string symbol, double price, double level, int dir,
 //+------------------------------------------------------------------+
 //| DetectFillingMode                                                 |
 //|                                                                   |
-//| FIX C-8: Removed orphaned code block that was accidentally       |
-//| copy-pasted here during Phase 6-C implementation. The block      |
-//| referenced undeclared identifiers magic/sym/sl/tp/dir, causing   |
-//| 8 compilation errors. The correct implementation of that logic   |
-//| already exists in ModifyPositionSafe's success path.             |
+//| C-8 fix: orphaned block (magic/sym/sl/tp/dir) removed. The       |
+//| correct implementation lives in ModifyPositionSafe's success     |
+//| path where those identifiers are properly declared.              |
 //+------------------------------------------------------------------+
 ENUM_ORDER_TYPE_FILLING DetectFillingMode()
   {
@@ -2659,7 +2814,7 @@ string TrimText(string value)
 
 void ApplyOptionalEditValue(string name, double value, string placeholder)
   {
-   string txt = (value <= 0.0) ? placeholder : DoubleToString(value, 0);
+   string txt   = (value <= 0.0) ? placeholder : DoubleToString(value, 0);
    color txtClr = (value <= 0.0) ? CLR_PLACEHOLDER : CLR_TEXT;
    ObjectSetString(0,  name, OBJPROP_TEXT,  txt);
    ObjectSetInteger(0, name, OBJPROP_COLOR, txtClr);
@@ -2680,21 +2835,6 @@ bool IsMouseOverPanelRect(int x, int y, int lx, int ly, int w, int h)
    int left = PanelLeftPx() + lx;
    int top  = g_PanelTop + ly;
    return (x >= left && x <= left + w && y >= top && y <= top + h);
-  }
-
-bool IsMouseOverObject(string name, int x, int y)
-  {
-   if(ObjectFind(0, name) < 0) return false;
-   long corner = ObjectGetInteger(0, name, OBJPROP_CORNER);
-   long xdist  = ObjectGetInteger(0, name, OBJPROP_XDISTANCE);
-   long ydist  = ObjectGetInteger(0, name, OBJPROP_YDISTANCE);
-   long w      = ObjectGetInteger(0, name, OBJPROP_XSIZE);
-   long h      = ObjectGetInteger(0, name, OBJPROP_YSIZE);
-   int left = (int)xdist;
-   int top  = (int)ydist;
-   if(corner == CORNER_RIGHT_UPPER)
-      left = ChartWidthPixels() - (int)xdist - (int)w;
-   return (x >= left && x <= left + (int)w && y >= top && y <= top + (int)h);
   }
 
 void UpdateHoverState(int x, int y)
@@ -2892,7 +3032,8 @@ void RefreshPanel()
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
    ObjectSetString(0, P+"BAL", OBJPROP_TEXT,
-                   "Bal $"+DoubleToString(bal, 2)+"   Eq $"+DoubleToString(eq, 2));
+                   "Bal $"+DoubleToString(bal, 2)+
+                   "   Eq $"+DoubleToString(eq, 2));
 
    int   pos    = PositionsTotal();
    color posClr = (pos >= 190) ? clrOrange : CLR_MUTED;
@@ -2965,7 +3106,8 @@ void RefreshBatchPanel()
    SetManagementButtonsEnabled(true);
   }
 
-void MakeLabel(string name, int lx, int ly, string txt, color clr, int sz, bool bold)
+void MakeLabel(string name, int lx, int ly, string txt,
+               color clr, int sz, bool bold)
   {
    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
    ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
@@ -2980,7 +3122,8 @@ void MakeLabel(string name, int lx, int ly, string txt, color clr, int sz, bool 
    ObjectSetInteger(0, name, OBJPROP_BACK,      false);
   }
 
-void MakeText(string name, int lx, int ly, string txt, color clr, int sz, bool bold)
+void MakeText(string name, int lx, int ly, string txt,
+              color clr, int sz, bool bold)
   {
    MakeLabel(name, lx, ly, txt, clr, sz, bold);
    ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
@@ -3027,7 +3170,8 @@ void MakeButton(string name, int lx, int ly, int w, int h,
    ObjectSetInteger(0, name, OBJPROP_BACK,         false);
   }
 
-void MakeRect(string name, int lx, int ly, int w, int h, color bg, color border)
+void MakeRect(string name, int lx, int ly, int w, int h,
+              color bg, color border)
   {
    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
@@ -3048,17 +3192,20 @@ void MakeRect(string name, int lx, int ly, int w, int h, color bg, color border)
 //+------------------------------------------------------------------+
 void CreatePanel()
   {
-   MakeRect(P+"BG", 0, 0, PW, g_PanelMinimized ? PH_MIN : PH, CLR_BG, CLR_BORDER);
+   MakeRect(P+"BG", 0, 0, PW, g_PanelMinimized ? PH_MIN : PH,
+            CLR_BG, CLR_BORDER);
    MakePanelDragHandle(P+"BG");
 
    MakeRect(P+"TBAR", 0, 0, PW, PH_MIN, CLR_SURFACE, CLR_BORDER);
    MakePanelDragHandle(P+"TBAR");
    MakeText(P+"TITLE", 16, 12, "APEX EXECUTION", CLR_TEXT, 12, true);
    MakePanelDragHandle(P+"TITLE");
-   MakeText(P+"TSYM",  16, 43, Symbol()+"  "+EnumToString((ENUM_TIMEFRAMES)Period()),
+   MakeText(P+"TSYM",  16, 43,
+            Symbol()+"  "+EnumToString((ENUM_TIMEFRAMES)Period()),
             CLR_MUTED, 8, true);
    MakePanelDragHandle(P+"TSYM");
-   MakeButton(P+"MIN", 354, 18, 30, 28, g_PanelMinimized ? "+" : "-", CLR_SURFACE, CLR_TEXT);
+   MakeButton(P+"MIN", 354, 18, 30, 28,
+              g_PanelMinimized ? "+" : "-", CLR_SURFACE, CLR_TEXT);
 
    if(g_PanelMinimized)
      {
@@ -3067,8 +3214,8 @@ void CreatePanel()
      }
 
    MakeRect(P+"LIVE", 12, 84, PW-24, 76, C'18,21,30', CLR_DIVIDER);
-   MakeText(P+"SPREAD", 22,  98, "Spread  --",     clrLime,  9, true);
-   MakeText(P+"BAL",    22, 126, "Bal --",          CLR_MUTED, 8, false);
+   MakeText(P+"SPREAD", 22,  98, "Spread  --",        clrLime,   9, true);
+   MakeText(P+"BAL",    22, 126, "Bal --",             CLR_MUTED, 8, false);
    MakeText(P+"POS",    22, 146, "Positions  0 / 200", CLR_MUTED, 8, false);
 
    MakeRect(P+"DIV1", 12, 174, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
@@ -3089,27 +3236,31 @@ void CreatePanel()
 
    MakeRect(P+"DIV2", 12, 350, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   MakeButton(P+"BUY",  BUY_X,  BUY_Y,  BUY_W,  BUY_H,  "BUY  F1",  CLR_BUY,  clrWhite);
-   MakeButton(P+"SELL", SELL_X, SELL_Y, SELL_W, SELL_H, "SELL  F2", CLR_SELL, clrWhite);
+   MakeButton(P+"BUY",  BUY_X,  BUY_Y,  BUY_W,  BUY_H,
+              "BUY  F1",  CLR_BUY,  clrWhite);
+   MakeButton(P+"SELL", SELL_X, SELL_Y, SELL_W, SELL_H,
+              "SELL  F2", CLR_SELL, clrWhite);
 
-   MakeButton(P+"CLOSE", 16, 422, 368, 34, "CLOSE SELECTED  F3",       CLR_CLOSE, clrWhite);
-   MakeButton(P+"BE",    16, 464, 368, 34, "MOVE TO BREAKEVEN  F4",    CLR_BE,    clrWhite);
+   MakeButton(P+"CLOSE", 16, 422, 368, 34,
+              "CLOSE SELECTED  F3",    CLR_CLOSE, clrWhite);
+   MakeButton(P+"BE",    16, 464, 368, 34,
+              "MOVE TO BREAKEVEN  F4", CLR_BE,    clrWhite);
    MakeButton(P+"PART",  16, 506, 368, 34,
               "PARTIAL CLOSE  "+DoubleToString(PartialClosePct, 0)+"%",
               CLR_PART, clrWhite);
 
    MakeRect(P+"DIV3", 12, 556, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   MakeText(P+"SEC2",  16, 572, "ACTIVE BATCH",         CLR_SUBTLE, 8, true);
+   MakeText(P+"SEC2",  16, 572, "ACTIVE BATCH",        CLR_SUBTLE, 8, true);
    MakeButton(P+"BPREV", 16,  602, 42, 28, "<", CLR_SURFACE, CLR_TEXT);
    MakeButton(P+"BNEXT", 342, 602, 42, 28, ">", CLR_SURFACE, CLR_TEXT);
-   MakeText(P+"BSEL",  70, 607, "No Active Batches",    clrOrange,  8, true);
-   MakeText(P+"BMETA", 16, 640, "Symbol --   Pos 0",    CLR_MUTED,  8, false);
-   MakeText(P+"BPNL",  240, 640, "PnL --",              CLR_MUTED,  8, true);
+   MakeText(P+"BSEL",  70, 607, "No Active Batches",   clrOrange,  8, true);
+   MakeText(P+"BMETA", 16, 640, "Symbol --   Pos 0",   CLR_MUTED,  8, false);
+   MakeText(P+"BPNL",  240, 640, "PnL --",             CLR_MUTED,  8, true);
 
-   MakeRect(P+"SBAR",   0, 664, PW,  44, CLR_SURFACE, CLR_BORDER);
-   MakeText(P+"SLAB",  16, 672, "STATUS", CLR_SUBTLE, 7, true);
-   MakeText(P+"STATUS",16, 690, "Ready",  clrLime,    9, true);
+   MakeRect(P+"SBAR",   0, 664, PW, 44,  CLR_SURFACE, CLR_BORDER);
+   MakeText(P+"SLAB",  16, 672, "STATUS", CLR_SUBTLE,  7, true);
+   MakeText(P+"STATUS",16, 690, "Ready",  clrLime,     9, true);
 
    RefreshBatchPanel();
    ChartRedraw();
