@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.03"
+#property version   "4.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -137,8 +137,13 @@ const int TRADE_RETRY_MAX    = 4;
 const int MODIFY_COOLDOWN_MS = 200;
 
 // State-dependent exec-state timeouts
+// C-001 fix: EXEC_EXECUTING_TIMEOUT_MS raised from 120,000 to 360,000 (6 min).
+// Worst-case 200-order fill loop: 200 orders x 4 retries x ~500ms/attempt = ~400s.
+// 120,000ms was reachable under normal adverse broker conditions and triggered
+// force-release mid-loop, leaving g_IsExecuting=true permanently (pre-fix).
+// 360,000ms covers the worst case with margin.
 const int EXEC_STATE_TIMEOUT_MS      = 10000;  // 10 s  — general management states
-const int EXEC_EXECUTING_TIMEOUT_MS  = 120000; // 2 min — order fill loop (200 trades max)
+const int EXEC_EXECUTING_TIMEOUT_MS  = 360000; // 6 min — order fill loop (200 trades max)
 const int EXEC_MODIFYING_TIMEOUT_MS  = 30000;  // 30 s  — modify queue dispatch
 
 // Phase 8: integrity check interval
@@ -200,10 +205,6 @@ const int RETRY_ESCALATION_FACTOR = 4;
 
 // Rate limit raised from 120 to 360 to match capacity=6 throughput (Fix 2).
 // At capacity=6 and 100ms timer: max throughput = 6 * 600 = 3600/min.
-// 120 was calibrated for old capacity=2 (120/min exact match).
-// With capacity=6, 120 saturated in ~2 seconds of trailing, leaving ~80 of
-// 200 trailing positions un-updated for 58 seconds per minute.
-// 360 matches actual processing capacity (6/tick * 600 ticks/min).
 const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 360;
 const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
 int g_InFlightModifies = 0;
@@ -833,6 +834,13 @@ void ExecuteOrders(int direction)
    GlobalVariableSet("MOE_BATCH_DIR",  (double)direction);
    GlobalVariableSet("MOE_BATCH_LOTS", lot);
 
+   // C-002 fix: Persist pip-based SL/TP to GlobalVars so RebuildBatchRegistry
+   // can enqueue repair for positions with SL=0/TP=0 after a VPS restart that
+   // occurs while PostFillAttachSLTP queue items are still pending.
+   // These globals are cleaned up in RemoveBatch().
+   GlobalVariableSet("MOE_PIP_SL_"+IntegerToString(batchID), g_PanelSL);
+   GlobalVariableSet("MOE_PIP_TP_"+IntegerToString(batchID), g_PanelTP);
+
    //--- 6. EXECUTION LOOP
    int filled = 0;
    int errors = 0;
@@ -949,7 +957,7 @@ void ExecuteOrders(int direction)
 //| here. Those updates fired on enqueue (pre-confirmation) and      |
 //| caused BackupSyncCheck to see target SL in PosState while the    |
 //| broker still had SL=0, actively suppressing needed repair.       |
-//| ModifyPositionSafe's confirmed success path handles both updates. |
+//| ModifyPositionSafe's confirmed success path handles both updates.|
 //+------------------------------------------------------------------+
 void PostFillAttachSLTP(long batchID, int direction)
   {
@@ -1003,6 +1011,80 @@ void PostFillAttachSLTP(long batchID, int direction)
    batchIndex = FindBatchIndex(batchID);
    if(batchIndex >= 0)
       g_Batches[batchIndex].syncing = false;
+  }
+
+//+------------------------------------------------------------------+
+//| RepairMissingSLTP — C-002 fix                                     |
+//|                                                                   |
+//| Called at the end of RebuildBatchRegistryFromPositions().        |
+//| For every managed position with SL=0 or TP=0, checks whether a  |
+//| persisted pip SL/TP exists in GlobalVars (written by             |
+//| ExecuteOrders and cleaned up by RemoveBatch). If found, computes |
+//| correct price-level SL/TP from PriceOpen and enqueues repair.   |
+//|                                                                   |
+//| This covers the gap where a VPS restart occurs while             |
+//| PostFillAttachSLTP queue items are still pending: the broker has |
+//| SL=0, PosState is rebuilt with SL=0, and without this function  |
+//| BackupSyncCheck would see no discrepancy and never repair.       |
+//+------------------------------------------------------------------+
+void RepairMissingSLTP()
+  {
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      if(!posInfo.SelectByIndex(i)) continue;
+
+      long magic = posInfo.Magic();
+      if(magic <= 0) continue;
+
+      int batchIndex = FindBatchIndex(magic);
+      if(batchIndex < 0 || !g_Batches[batchIndex].active) continue;
+
+      double posSL = posInfo.StopLoss();
+      double posTP = posInfo.TakeProfit();
+
+      string slKey = "MOE_PIP_SL_"+IntegerToString(magic);
+      string tpKey = "MOE_PIP_TP_"+IntegerToString(magic);
+
+      bool hasPipSL = GlobalVariableCheck(slKey);
+      bool hasPipTP = GlobalVariableCheck(tpKey);
+      if(!hasPipSL && !hasPipTP) continue;
+
+      double pipSL = hasPipSL ? GlobalVariableGet(slKey) : 0.0;
+      double pipTP = hasPipTP ? GlobalVariableGet(tpKey) : 0.0;
+
+      bool needsSL = (posSL == 0.0 && pipSL > 0.0);
+      bool needsTP = (posTP == 0.0 && pipTP > 0.0);
+      if(!needsSL && !needsTP) continue;
+
+      double openPx    = posInfo.PriceOpen();
+      int    direction = g_Batches[batchIndex].direction;
+      string sym       = posInfo.Symbol();
+      double pip       = GetPipSize(sym);
+      double newSL     = posSL;
+      double newTP     = posTP;
+
+      if(needsSL)
+        {
+         newSL = (direction == 0)
+                 ? NormalizeDouble(openPx - pipSL * pip, _Digits)
+                 : NormalizeDouble(openPx + pipSL * pip, _Digits);
+         newSL = EnforceStopsLevel(sym, openPx, newSL, direction, false);
+        }
+      if(needsTP)
+        {
+         newTP = (direction == 0)
+                 ? NormalizeDouble(openPx + pipTP * pip, _Digits)
+                 : NormalizeDouble(openPx - pipTP * pip, _Digits);
+         newTP = EnforceStopsLevel(sym, openPx, newTP, direction, true);
+        }
+
+      uint rc = 0;
+      ModifyPositionQueued(posInfo.Ticket(), newSL, newTP, rc, "REPAIR_SLTP", false);
+      LogEvent("REPAIR_SLTP", "ticket="+IntegerToString((long)posInfo.Ticket())+
+               " batch="+IntegerToString(magic)+
+               " newSL="+DoubleToString(newSL, _Digits)+
+               " newTP="+DoubleToString(newTP, _Digits));
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1585,9 +1667,9 @@ bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
    uint now = GetTickCount();
    if(idx >= 0)
      {
-      g_ModifyQueue[idx].sl            = sl;
-      g_ModifyQueue[idx].tp            = tp;
-      g_ModifyQueue[idx].context       = context;
+      g_ModifyQueue[idx].sl      = sl;
+      g_ModifyQueue[idx].tp      = tp;
+      g_ModifyQueue[idx].context = context;
       g_ModifyQueue[idx].requestedAtMs = now;
       return true;
      }
@@ -1759,7 +1841,14 @@ bool AcquireExecState(int desired)
 //+------------------------------------------------------------------+
 //| ReleaseExecState                                                  |
 //|                                                                   |
-//| Phase 8: split timeout by state (EXECUTING=2min, MODIFYING=30s, |
+//| C-001 fix: force-release branch now checks whether the stuck     |
+//| state is EXEC_EXECUTING. If so, it clears g_IsExecuting and      |
+//| calls UnlockButtons() before resetting the exec state. Without   |
+//| this, a force-release during a long fill loop left g_IsExecuting |
+//| = true permanently, blocking trailing, sync, and new executions  |
+//| until terminal restart.                                           |
+//|                                                                   |
+//| Phase 8: split timeout by state (EXECUTING=6min, MODIFYING=30s, |
 //| others=10s). Added force-release logging so stuck states are     |
 //| visible in the diagnostics log without waiting for DiagWarn.     |
 //+------------------------------------------------------------------+
@@ -1781,6 +1870,14 @@ void ReleaseExecState(int expected)
      }
    else if(g_ExecStateStartMs > 0 && now - g_ExecStateStartMs > timeout)
      {
+      // C-001 fix: if the stuck state is EXEC_EXECUTING, the fill loop
+      // owns g_IsExecuting and has LockButtons() applied. Both must be
+      // cleared here so trailing, sync, and new executions can resume.
+      if(g_ExecState == EXEC_EXECUTING)
+        {
+         g_IsExecuting = false;
+         UnlockButtons();
+        }
       LogEvent("EXEC_FORCE_RELEASE",
                "state="+ExecStateText(g_ExecState)+
                " expected="+ExecStateText(expected)+
@@ -2361,9 +2458,6 @@ void CleanupPosStates()
 //|                                                                   |
 //| Removes retry state entries for positions that are no longer     |
 //| open. Called from the EXEC_RECOVERING block on every timer tick. |
-//| Prevents unbounded growth of g_RetryStates[] when positions      |
-//| close while under retry cooldown (zombie entries that ClearRetry |
-//| never fires on because the success path is never reached).       |
 //+------------------------------------------------------------------+
 void CleanupRetryStates()
   {
@@ -2381,10 +2475,6 @@ void CleanupRetryStates()
 //| CleanupModifyLocks — Phase 8                                      |
 //|                                                                   |
 //| Removes modify lock entries for positions that no longer exist.  |
-//| IsModifyLocked() already cleans expired locks by time inline;    |
-//| this function adds position-existence cleanup so locks for        |
-//| closed positions don't occupy slots if the ticket is re-used     |
-//| on a future position (edge case on some brokers).                |
 //+------------------------------------------------------------------+
 void CleanupModifyLocks()
   {
@@ -2403,9 +2493,6 @@ void CleanupModifyLocks()
 //|                                                                   |
 //| Read-only periodic check (every 60 seconds) that logs any        |
 //| discrepancy between the batch registry and live positions.       |
-//| Does not repair; repair is handled by CleanupOrphanBatches and   |
-//| BackupSyncCheck. Provides an early warning signal for silent     |
-//| desynchronization under long VPS runtimes.                       |
 //+------------------------------------------------------------------+
 void IntegrityCheck()
   {
@@ -2415,7 +2502,6 @@ void IntegrityCheck()
       return;
    g_LastIntegrityCheckMs = now;
 
-   // Check each batch has live positions; note fill-count drift
    for(int b = 0; b < ArraySize(g_Batches); b++)
      {
       int cnt = CountBatchPositions(g_Batches[b].magic, g_Batches[b].symbol);
@@ -2431,7 +2517,6 @@ void IntegrityCheck()
                   " live="+IntegerToString(cnt));
      }
 
-   // Check PosState count vs managed live positions
    int managedPosCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
@@ -2529,6 +2614,12 @@ void RebuildBatchRegistryFromPositions()
                " positions="+IntegerToString(g_Batches[b].filled)+
                " SL="+DoubleToString(g_Batches[b].sl, _Digits)+
                " TP="+DoubleToString(g_Batches[b].tp, _Digits));
+
+   // C-002 fix: after rebuilding from broker state (which may have SL=0/TP=0
+   // for positions that were awaiting PostFillAttach when the VPS restarted),
+   // scan all managed positions and enqueue repair for any with missing stops
+   // where the intended pip SL/TP was persisted to GlobalVars.
+   RepairMissingSLTP();
   }
 
 void CleanupOrphanBatches()
@@ -2647,6 +2738,9 @@ bool RemoveBatch(long magic)
    if(index < 0) return false;
    GlobalVariableDel("MOE_KNOWN_"+IntegerToString(magic));
    GlobalVariableDel("MOE_REQ_"+IntegerToString(magic));
+   // C-002 fix: clean up persisted pip SL/TP globals for this batch.
+   GlobalVariableDel("MOE_PIP_SL_"+IntegerToString(magic));
+   GlobalVariableDel("MOE_PIP_TP_"+IntegerToString(magic));
    RemovePosStatesByMagic(magic);
    int size = ArraySize(g_Batches);
    for(int i = index; i < size - 1; i++)
@@ -2657,11 +2751,24 @@ bool RemoveBatch(long magic)
    return true;
   }
 
+//+------------------------------------------------------------------+
+//| GenerateBatchMagic                                                |
+//|                                                                   |
+//| C-003 fix: salt now incorporates ChartID() so two EA instances   |
+//| running on the same account simultaneously (same login%1000,     |
+//| same TimeCurrent() second, counter reset to 0 on each OnInit)   |
+//| produce different magic numbers and cannot adopt each other's    |
+//| positions through the IsOurBatchMagic GlobalVar check.           |
+//+------------------------------------------------------------------+
 long GenerateBatchMagic()
   {
    static long counter = 0;
    long magic = 0;
-   long salt = (long)(AccountInfoInteger(ACCOUNT_LOGIN) % 1000);
+   // Use login % 1000 in high digits and ChartID % 10000 in low digits.
+   // Combined salt fits within long arithmetic without overflow at MagicBase
+   // values up to 999999 and account logins up to 9 digits.
+   long salt = (long)(AccountInfoInteger(ACCOUNT_LOGIN) % 1000) * 10000
+             + (long)(ChartID() % 10000);
    do
      {
       counter++;
@@ -2670,17 +2777,6 @@ long GenerateBatchMagic()
      }
    while(BatchExists(magic) || MagicInOpenPositions(magic));
    return magic;
-  }
-
-int CountBatchPositions(long magic)
-  {
-   int n = 0;
-   for(int i = PositionsTotal()-1; i >= 0; i--)
-     {
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic() == magic) n++;
-     }
-   return n;
   }
 
 double GetPipSize(string symbol)
@@ -2769,10 +2865,6 @@ double EnforceStopsLevel(string symbol, double price, double level,
 
 //+------------------------------------------------------------------+
 //| DetectFillingMode                                                 |
-//|                                                                   |
-//| C-8 fix: orphaned block (magic/sym/sl/tp/dir) removed. The       |
-//| correct implementation lives in ModifyPositionSafe's success     |
-//| path where those identifiers are properly declared.              |
 //+------------------------------------------------------------------+
 ENUM_ORDER_TYPE_FILLING DetectFillingMode()
   {
