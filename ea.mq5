@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.05"
+#property version   "4.06"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -142,6 +142,14 @@ const int MODIFY_COOLDOWN_MS = 200;
 // 120,000ms was reachable under normal adverse broker conditions and triggered
 // force-release mid-loop, leaving g_IsExecuting=true permanently (pre-fix).
 // 360,000ms covers the worst case with margin.
+//
+// H-001 note: The synchronous fill loop inherently blocks all timer operations
+// (trailing, sync, cleanup, rebuild) for its entire duration. This is an
+// architectural property of the single-threaded MQL5 model and cannot be
+// eliminated without async refactoring. Worst-case blackout:
+//   200 orders x TRADE_RETRY_MAX(4) retries x max_delay ~500ms = ~400s.
+// EXEC_EXECUTING_TIMEOUT_MS is set to cover this with margin. All timer
+// operations will resume normally once execution completes.
 const int EXEC_STATE_TIMEOUT_MS      = 10000;  // 10 s  — general management states
 const int EXEC_EXECUTING_TIMEOUT_MS  = 360000; // 6 min — order fill loop (200 trades max)
 const int EXEC_MODIFYING_TIMEOUT_MS  = 30000;  // 30 s  — modify queue dispatch
@@ -358,6 +366,21 @@ void OnTimer()
      {
       g_WasConnected = true;
       SetStatus("Reconnected — re-syncing...", clrYellow);
+
+      // H-003 fix: flush the modify queue on reconnect before any rebuild or
+      // resync. Queue entries computed before disconnect carry price-level SL/TP
+      // values valid at pre-disconnect prices. Applying them post-reconnect
+      // (e.g., a trailing SL above the post-reconnect bid) produces
+      // INVALID_STOPS rejections from the broker, which then applies a
+      // LockModify() on each affected ticket and temporarily blocks correct
+      // trailing and sync updates. Flushing here is safe: rebuild + resync +
+      // trailing will re-enqueue fresh, price-correct values after reconnect
+      // stabilises. g_ModifyQueuedCount is reset to match the empty queue.
+      ArrayResize(g_ModifyQueue, 0);
+      g_ModifyQueuedCount = 0;
+      LogEvent("RECONNECT", "Flushed modify queue ("+
+               IntegerToString(ArraySize(g_ModifyQueue))+" entries cleared)");
+
       g_PendingReconnectRebuild = true;
       g_PendingReconnectResync  = true;
       g_ReconnectDetectedMs     = nowMs;
@@ -2183,9 +2206,22 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
    return false;
   }
 
+//+------------------------------------------------------------------+
+//| ClosePositionSafe                                                 |
+//|                                                                   |
+//| H-002 fix: IsUnderRetryCooldown check is now performed BEFORE    |
+//| the close-count window accounting. In v4.05 the closeCount slot  |
+//| was consumed unconditionally before the cooldown check, meaning  |
+//| tickets under retry cooldown silently burned rate-limit budget   |
+//| and could exhaust MAX_CLOSES_PER_BATCH_PER_MIN with rejected     |
+//| requests, blocking legitimate closes for up to 60 seconds.       |
+//| Fix matches the ClosePositionPartialSafe pattern (Fix 4).        |
+//+------------------------------------------------------------------+
 bool ClosePositionSafe(ulong ticket, uint &rc, string context)
   {
    rc = 0;
+
+   //--- Global concurrent close cap
    if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
      {
       rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
@@ -2194,6 +2230,17 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
       return false;
      }
 
+   // H-002 fix: retry cooldown check BEFORE close-count accounting.
+   // A ticket under cooldown must not consume a closeCount budget slot.
+   if(IsUnderRetryCooldown(ticket))
+     {
+      rc = TRADE_RETCODE_LOCKED;
+      LogEvent("CLOSE_COOLDOWN", context+" ticket="+
+               IntegerToString((long)ticket));
+      return false;
+     }
+
+   //--- Per-batch close rate limit (checked and incremented after cooldown guard)
    int bidx = -1;
    if(PositionSelectByTicket(ticket))
      {
@@ -2217,14 +2264,6 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
          return false;
         }
       g_Batches[bidx].closeCount++;
-     }
-
-   if(IsUnderRetryCooldown(ticket))
-     {
-      rc = TRADE_RETCODE_LOCKED;
-      LogEvent("CLOSE_COOLDOWN", context+" ticket="+
-               IntegerToString((long)ticket));
-      return false;
      }
 
    for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
