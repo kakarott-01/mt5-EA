@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                             ApexExecution.mq5   |
+//|                                             ApexExecution.mq5    |
 //|                                               Arunaditya Lal     |
 //|                                        https://www.mql5.com      |
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.07"
+#property version   "4.08"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -19,7 +19,7 @@
 #endif
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS                                                  |
+//| INPUT PARAMETERS                                                 |
 //+------------------------------------------------------------------+
 input group "=== EXECUTION ==="
 input int      NumTrades           = 1;
@@ -61,13 +61,13 @@ input int      DiagnosticsQueueWarn  = 50;
 input int      DiagnosticsStateWarnMs= 3000;
 
 //+------------------------------------------------------------------+
-//| OBJECTS                                                           |
+//| OBJECTS                                                          |
 //+------------------------------------------------------------------+
 CTrade        trade;
 CPositionInfo posInfo;
 
 //+------------------------------------------------------------------+
-//| STRUCTS                                                           |
+//| STRUCTS                                                          |
 //+------------------------------------------------------------------+
 struct BatchInfo
   {
@@ -129,7 +129,7 @@ struct RetryState
   };
 
 //+------------------------------------------------------------------+
-//| EXEC STATE                                                        |
+//| EXEC STATE                                                       |
 //+------------------------------------------------------------------+
 // EXEC_MODIFYING (7): distinguishes modify-queue dispatch from fill loop.
 enum EXEC_STATE { EXEC_IDLE=0, EXEC_EXECUTING=1, EXEC_SYNCING=2, EXEC_TRAILING=3,
@@ -137,7 +137,7 @@ enum EXEC_STATE { EXEC_IDLE=0, EXEC_EXECUTING=1, EXEC_SYNCING=2, EXEC_TRAILING=3
                   EXEC_MODIFYING=7 };
 
 //+------------------------------------------------------------------+
-//| GLOBAL STATE                                                      |
+//| GLOBAL STATE                                                     |
 //+------------------------------------------------------------------+
 BatchInfo     g_Batches[];
 PositionState g_PosStates[];
@@ -164,7 +164,7 @@ bool    g_TrailingEnabled        = true;
 // Panel interaction state
 bool    g_HoverBuy               = false;
 bool    g_HoverSell              = false;
-bool    g_HoverTrail             = false;   // v4.07
+bool    g_HoverTrail             = false;
 int     g_SelectedBatchIndex     = -1;
 int     g_PanelNumTrades         = 0;
 double  g_PanelLotSize           = 0;
@@ -182,8 +182,6 @@ uint    g_ExecStateStartMs = 0;
 uint    g_LastTimerMs      = 0;
 
 // Counters
-// v4.07: g_ModifyQueuedCount removed (M-AUDIT-002 fix — was misleading dead counter)
-//        Replaced with g_ModifyTotalEnqueued for correct semantics.
 int g_ModifyTotalEnqueued = 0;
 int g_ModifySuccessCount  = 0;
 int g_ModifyFailCount     = 0;
@@ -198,8 +196,24 @@ int  g_ModQSkipCount    = 0;
 int  g_RebuildSkipCount = 0;
 int  g_CloseSkipCount   = 0;
 
+// v4.08: Async burst execution dispatcher state
+bool   g_PendingExecActive       = false;
+int    g_PendingExecTotal        = 0;
+int    g_PendingExecDispatched   = 0;
+int    g_PendingExecErrors       = 0;
+long   g_PendingExecBatchID      = 0;
+double g_PendingExecLot          = 0.0;
+int    g_PendingExecDir          = 0;
+double g_PendingExecSL           = 0.0;
+double g_PendingExecTP           = 0.0;
+uint   g_PendingExecLastBurstMs  = 0;
+bool   g_PendingExecPostAttach   = false;
+uint   g_PendingExecPostAttachMs = 0;
+double g_PendingExecBatchSLPrice = 0.0;
+double g_PendingExecBatchTPPrice = 0.0;
+
 //+------------------------------------------------------------------+
-//| CONSTANTS                                                         |
+//| CONSTANTS                                                        |
 //+------------------------------------------------------------------+
 const int TRADE_DELAY_MIN_MS = 10;
 const int TRADE_DELAY_MAX_MS = 25;
@@ -207,7 +221,7 @@ const int TRADE_RETRY_MAX    = 4;
 const int MODIFY_COOLDOWN_MS = 200;
 const int RETRY_ESCALATION_FACTOR = 4;
 
-// C-001 fix: EXEC_EXECUTING_TIMEOUT_MS=360s covers worst-case 200-order fill loop.
+// C-001 fix: EXEC_EXECUTING_TIMEOUT_MS=360s covers worst-case scenarios.
 const int EXEC_STATE_TIMEOUT_MS      = 10000;
 const int EXEC_EXECUTING_TIMEOUT_MS  = 360000;
 const int EXEC_MODIFYING_TIMEOUT_MS  = 30000;
@@ -218,11 +232,19 @@ const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
 const int MAX_CLOSES_PER_BATCH_PER_MIN    = 60;
 const int MAX_GLOBAL_CONCURRENT_CLOSES    = 4;
 
-// v4.07: M-AUDIT-001 fix — explicit modify queue size cap
+// v4.07: M-AUDIT-001 fix
 const int MAX_MODIFY_QUEUE_SIZE = 250;
 
+// v4.08: Async burst dispatcher constants
+// BURST_ORDER_LIMIT: max orders per burst window. Reduce to 25-30 if Exness returns 10027.
+// BURST_COOLDOWN_MS: gap between bursts. 5 bursts x 200ms = ~1s for 200 orders.
+// POST_ATTACH_DELAY_MS: timer-gated wait replacing Sleep(250) in PostFillAttachSLTP.
+const int BURST_ORDER_LIMIT    = 40;
+const int BURST_COOLDOWN_MS    = 200;
+const int POST_ATTACH_DELAY_MS = 500;
+
 //+------------------------------------------------------------------+
-//| PANEL CONSTANTS                                                   |
+//| PANEL CONSTANTS                                                  |
 //+------------------------------------------------------------------+
 const string P              = "MOE_";
 const string SL_PLACEHOLDER = "50";
@@ -230,10 +252,9 @@ const string TP_PLACEHOLDER = "100";
 const int    PR             = 36;
 const int    PT             = 45;
 const int    PW             = 400;
-const int    PH             = 774;    // v4.07: expanded from 700
+const int    PH             = 774;
 const int    PH_MIN         = 70;
 
-// v4.07: BUY/SELL adjusted for new layout
 const int    BUY_X          = 16;
 const int    BUY_Y          = 336;
 const int    BUY_W          = 176;
@@ -243,7 +264,6 @@ const int    SELL_Y         = 336;
 const int    SELL_W         = 176;
 const int    SELL_H         = 44;
 
-// v4.07: trailing toggle button position constants
 const int    TRAIL_X        = 16;
 const int    TRAIL_Y        = 402;
 const int    TRAIL_W        = 368;
@@ -268,14 +288,12 @@ const color  CLR_BE          = C'25,95,150';
 const color  CLR_PART        = C'115,85,10';
 const color  CLR_PLACEHOLDER = C'110,115,130';
 
-// v4.07: trailing button colors
 const color  CLR_TRAIL_ON        = C'0,150,95';
 const color  CLR_TRAIL_ON_HOVER  = C'0,190,125';
 const color  CLR_TRAIL_OFF       = C'45,55,45';
 const color  CLR_TRAIL_OFF_HOVER = C'62,78,62';
 const color  CLR_TRAIL_DIS       = C'38,38,42';
 
-// v4.07: status semantic colors
 const color  CLR_STATUS_OK      = C'0,200,110';
 const color  CLR_STATUS_WARN    = C'255,200,0';
 const color  CLR_STATUS_ERROR   = C'220,80,80';
@@ -295,7 +313,7 @@ int PX(int lx) { return g_PanelRight + PW - lx; }
 int PY(int ly) { return g_PanelTop + ly; }
 
 //+------------------------------------------------------------------+
-//| FORWARD DECLARATIONS                                              |
+//| FORWARD DECLARATIONS                                             |
 //+------------------------------------------------------------------+
 void RefreshTrailingButton();
 void RefreshBatchPanel();
@@ -304,16 +322,17 @@ string GetBreakevenSkipReason(long magic);
 double BatchTotalLots(long magic, string symbol);
 bool IsBatchBreakevenActive(long magic, string symbol);
 void ToggleTrailing();
+void ProcessExecutionBurst();
+bool DispatchOrderNow(int direction, double lot, string comment, uint &rc);
 
 //+------------------------------------------------------------------+
-//| OnInit                                                            |
+//| OnInit                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
   {
    g_IsDeinitializing = false;
    LoadPanelLayout();
 
-   // v4.07: initialize trailing toggle from input config
    g_TrailingEnabled = (TrailingStop > 0.0);
 
    ENUM_ACCOUNT_MARGIN_MODE marginMode =
@@ -335,7 +354,7 @@ int OnInit()
    ENUM_ORDER_TYPE_FILLING fill = DetectFillingMode();
    trade.SetDeviationInPoints(Slippage);
    trade.SetTypeFilling(fill);
-   trade.SetAsyncMode(false);
+   trade.SetAsyncMode(false);   // v4.08: default sync; toggled async only during burst
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
 
    RebuildBatchRegistryFromPositions();
@@ -358,17 +377,27 @@ int OnInit()
    if(!EventSetMillisecondTimer(100))
       LogEvent("INIT_WARN", "Timer setup failed. Error="+IntegerToString(GetLastError()));
 
-   Print("ApexExecution v4.07: Ready on ", Symbol());
+   Print("ApexExecution v4.08: Ready on ", Symbol());
    return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
-//| OnDeinit                                                          |
+//| OnDeinit                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
    g_IsDeinitializing = true;
-   g_AbortFlag = true;
+   g_AbortFlag        = true;
+
+   // v4.08: abort any in-progress async burst
+   if(g_PendingExecActive || g_PendingExecPostAttach)
+     {
+      g_PendingExecActive     = false;
+      g_PendingExecPostAttach = false;
+      trade.SetAsyncMode(false);
+      LogEvent("DEINIT", "Aborted active burst dispatcher on deinit");
+     }
+
    SavePanelLayout();
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, false);
    EventKillTimer();
@@ -377,7 +406,7 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
-//| OnTimer — 100ms heartbeat                                         |
+//| OnTimer — 100ms heartbeat                                        |
 //+------------------------------------------------------------------+
 void OnTimer()
   {
@@ -408,7 +437,7 @@ void OnTimer()
 
       // H-003 fix: flush stale pre-disconnect price-level queue entries
       ArrayResize(g_ModifyQueue, 0);
-      g_ModifyTotalEnqueued = 0;  // v4.07: reset enqueue counter on flush
+      g_ModifyTotalEnqueued = 0;
       LogEvent("RECONNECT", "Flushed modify queue on reconnect");
 
       g_PendingReconnectRebuild = true;
@@ -501,6 +530,10 @@ void OnTimer()
         }
      }
 
+   //--- v4.08: Async burst execution engine
+   if(g_PendingExecActive || g_PendingExecPostAttach)
+      ProcessExecutionBurst();
+
    //--- Drop closed batches; purge zombie retry/lock entries
    if(connected)
      {
@@ -534,7 +567,7 @@ void OnTimer()
         }
      }
 
-   //--- Trailing stop — v4.07: gated by g_TrailingEnabled toggle
+   //--- Trailing stop
    if(TrailingStop > 0.0 && g_TrailingEnabled && ArraySize(g_Batches) > 0 &&
       connected && !syncDidWork && !g_IsExecuting)
      {
@@ -550,7 +583,7 @@ void OnTimer()
         }
      }
 
-   //--- Process queued modify requests (throttled, EXEC_MODIFYING state)
+   //--- Process queued modify requests
    if(connected && !g_IsExecuting)
      {
       if(AcquireExecState(EXEC_MODIFYING))
@@ -643,7 +676,7 @@ void OnChartEvent(const int    id,
         }
       if(sparam == P+"BUY")   ExecuteOrders(0);
       if(sparam == P+"SELL")  ExecuteOrders(1);
-      if(sparam == P+"TRAIL") ToggleTrailing();          // v4.07
+      if(sparam == P+"TRAIL") ToggleTrailing();
       if(sparam == P+"BPREV") SelectPreviousBatch();
       if(sparam == P+"BNEXT") SelectNextBatch();
       if(sparam == P+"CLOSE") CloseSelectedBatch();
@@ -660,10 +693,7 @@ void OnChartEvent(const int    id,
       if(lparam == 113) ExecuteOrders(1);          // F2 SELL
       if(lparam == 114) CloseSelectedBatch();      // F3 CLOSE
       if(lparam == 115) BreakevenSelectedBatch();  // F4 BREAKEVEN
-      if(lparam == 116) ToggleTrailing();          // F5 TRAILING — v4.07
-      // v4.07 C-AUDIT-001: ESC cannot abort mid-execution under MQL5 single-thread
-      // model — OnChartEvent cannot preempt a running handler. Show informative
-      // status instead of implying a non-functional abort.
+      if(lparam == 116) ToggleTrailing();          // F5 TRAILING
       if(lparam == 27)
         {
          if(!g_IsExecuting)
@@ -713,7 +743,7 @@ void OnChartEvent(const int    id,
   }
 
 //+------------------------------------------------------------------+
-//| ExecuteOrders — main BUY/SELL engine                             |
+//| ExecuteOrders — v4.08: pure initializer, dispatches via OnTimer  |
 //+------------------------------------------------------------------+
 void ExecuteOrders(int direction)
   {
@@ -772,11 +802,9 @@ void ExecuteOrders(int direction)
      }
 
    g_IsExecuting = true;
-   // v4.07 C-AUDIT-001: g_AbortFlag reset preserved here to clear any stale flag
-   // state from prior operations. The in-loop ESC abort check has been removed
-   // because it is dead code under the MQL5 single-thread model — OnChartEvent
-   // cannot preempt a running handler. g_AbortFlag still guards SendMarketOrderSafe
-   // for deinit/disconnect conditions (set by OnDeinit, not ESC).
+   // v4.08: g_AbortFlag reset clears stale state from prior operations.
+   // ESC abort is dead code under MQL5 single-thread model (C-AUDIT-001).
+   // g_AbortFlag guards DispatchOrderNow for deinit/disconnect conditions.
    g_AbortFlag = false;
    string dirStr = (direction == 0) ? "BUY" : "SELL";
 
@@ -810,8 +838,8 @@ void ExecuteOrders(int direction)
    if(numToOpen > slots)
      {
       numToOpen = slots;
+      // v4.08: Sleep(600) removed — async dispatch; status message is sufficient
       SetStatus("Reduced to "+IntegerToString(slots)+" trades (ceiling)", CLR_STATUS_WARN);
-      Sleep(600);
      }
 
    //--- 3. LOT SIZE
@@ -839,7 +867,7 @@ void ExecuteOrders(int direction)
       return;
      }
 
-   //--- 4. MARGIN CHECK
+   //--- 4. MARGIN CHECK (bulk estimate for entire batch)
    double marginPer = 0.0;
    ENUM_ORDER_TYPE oType = (direction == 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double priceForCheck  = (direction == 0)
@@ -860,7 +888,7 @@ void ExecuteOrders(int direction)
       return;
      }
 
-   //--- 5. GENERATE BATCH ID
+   //--- 5. GENERATE BATCH ID & REGISTER
    long batchID = GenerateBatchMagic();
 
    BatchInfo batch;
@@ -870,7 +898,6 @@ void ExecuteOrders(int direction)
    batch.sl        = g_PanelSL;
    batch.tp        = g_PanelTP;
    batch.syncing   = false;
-   // v4.07: trailing gated by both TrailingStop config AND g_TrailingEnabled toggle
    batch.trailing  = (TrailingStop > 0.0) && g_TrailingEnabled;
    batch.active    = true;
    batch.created   = TimeCurrent();
@@ -906,65 +933,259 @@ void ExecuteOrders(int direction)
    GlobalVariableSet("MOE_PIP_SL_"+IntegerToString(batchID), g_PanelSL);
    GlobalVariableSet("MOE_PIP_TP_"+IntegerToString(batchID), g_PanelTP);
 
-   //--- 6. EXECUTION LOOP
-   // v4.07 L-AUDIT-003: refresh filling mode before each execution to guard
-   // against broker reconfiguration during long VPS sessions.
+   //--- 6. REFRESH FILLING MODE (L-AUDIT-003 fix)
    ENUM_ORDER_TYPE_FILLING fill = DetectFillingMode();
    trade.SetTypeFilling(fill);
 
-   int filled = 0;
-   int errors = 0;
-   double pip = GetPipSize();
+   //--- 7. INITIALIZE ASYNC BURST DISPATCHER
+   // g_IsExecuting remains true and g_ExecState remains EXEC_EXECUTING.
+   // ProcessExecutionBurst() called on every OnTimer() tick drives all phases.
+   g_PendingExecActive       = true;
+   g_PendingExecTotal        = numToOpen;
+   g_PendingExecDispatched   = 0;
+   g_PendingExecErrors       = 0;
+   g_PendingExecBatchID      = batchID;
+   g_PendingExecLot          = lot;
+   g_PendingExecDir          = direction;
+   g_PendingExecSL           = g_PanelSL;
+   g_PendingExecTP           = g_PanelTP;
+   g_PendingExecLastBurstMs  = 0;    // zero = fire first burst on very next timer tick
+   g_PendingExecPostAttach   = false;
+   g_PendingExecPostAttachMs = 0;
+   g_PendingExecBatchSLPrice = 0.0;
+   g_PendingExecBatchTPPrice = 0.0;
 
-   for(int i = 1; i <= numToOpen; i++)
+   SetStatus("Dispatching "+dirStr+": 0/"+IntegerToString(numToOpen)+"...",
+             CLR_STATUS_EXEC);
+   LogEvent("BURST_INIT", "direction="+dirStr+
+            " total="+IntegerToString(numToOpen)+
+            " lot="+DoubleToString(lot, 2)+
+            " batchID="+IntegerToString(batchID)+
+            " burstSize="+IntegerToString(BURST_ORDER_LIMIT)+
+            " cooldownMs="+IntegerToString(BURST_COOLDOWN_MS));
+
+   // RETURN — execution continues via ProcessExecutionBurst() in OnTimer()
+  }
+
+//+------------------------------------------------------------------+
+//| DispatchOrderNow — v4.08                                         |
+//| Non-blocking single order dispatch for use in burst loop only.   |
+//| No Sleep(). No retry. Reads SL/TP pips from g_PendingExec state. |
+//+------------------------------------------------------------------+
+bool DispatchOrderNow(int direction, double lot, string comment, uint &rc)
+  {
+   rc = 0;
+   if(g_AbortFlag || g_IsDeinitializing ||
+      !TerminalInfoInteger(TERMINAL_CONNECTED))
      {
-      // NOTE: No ESC/g_AbortFlag check here — it is dead code under the MQL5
-      // single-thread model (C-AUDIT-001 fix). g_AbortFlag is still checked
-      // inside SendMarketOrderSafe for deinit and disconnect conditions.
+      rc = TRADE_RETCODE_CONNECTION;
+      return false;
+     }
 
-      double price, sl_price, tp_price;
-      if(direction == 0)
+   double pip = GetPipSize();
+   double price, sl_price, tp_price;
+
+   if(direction == 0)
+     {
+      price    = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+      sl_price = (g_PendingExecSL > 0)
+                 ? NormalizeDouble(price - g_PendingExecSL * pip, _Digits) : 0;
+      tp_price = (g_PendingExecTP > 0)
+                 ? NormalizeDouble(price + g_PendingExecTP * pip, _Digits) : 0;
+     }
+   else
+     {
+      price    = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+      sl_price = (g_PendingExecSL > 0)
+                 ? NormalizeDouble(price + g_PendingExecSL * pip, _Digits) : 0;
+      tp_price = (g_PendingExecTP > 0)
+                 ? NormalizeDouble(price - g_PendingExecTP * pip, _Digits) : 0;
+     }
+
+   sl_price = EnforceStopsLevel(Symbol(), price, sl_price, direction, false);
+   tp_price = EnforceStopsLevel(Symbol(), price, tp_price, direction, true);
+
+   // Capture price-based SL/TP from the very first dispatch for batch stops
+   if(g_PendingExecDispatched == 0)
+     {
+      g_PendingExecBatchSLPrice = sl_price;
+      g_PendingExecBatchTPPrice = tp_price;
+     }
+
+   ResetLastError();
+   g_LastTradeActionMs = GetTickCount();   // record timestamp — no Sleep()
+
+   bool ok = (direction == 0)
+      ? trade.Buy(lot, Symbol(), price, sl_price, tp_price, comment)
+      : trade.Sell(lot, Symbol(), price, sl_price, tp_price, comment);
+
+   rc = trade.ResultRetcode();
+   bool success = (ok && IsSuccessRetcode(rc));
+   UpdateTradePacing(rc, success);
+   return success;
+  }
+
+//+------------------------------------------------------------------+
+//| ProcessExecutionBurst — v4.08                                    |
+//| Called on every OnTimer() tick while g_IsExecuting is true.      |
+//|                                                                  |
+//| Phase 1 (g_PendingExecActive):                                   |
+//|   Fires up to BURST_ORDER_LIMIT async orders per                 |
+//|   BURST_COOLDOWN_MS window. Transitions to Phase 2 when done.    |
+//|                                                                  |
+//| Phase 2 (g_PendingExecPostAttach):                               |
+//|   Waits POST_ATTACH_DELAY_MS for broker fills to settle.         |
+//|   Runs PostFillAttachSLTP, finalizes batch, releases state.      |
+//|                                                                  |
+//| SetAsyncMode(true) is active ONLY inside the burst firing loop.  |
+//| It is explicitly restored to false in ALL exit paths.            |
+//+------------------------------------------------------------------+
+void ProcessExecutionBurst()
+  {
+   if(g_IsDeinitializing) return;
+
+   uint now = GetTickCount();
+
+   //=================================================================
+   //  PHASE 2 — post-attach delay completed
+   //=================================================================
+   if(g_PendingExecPostAttach)
+     {
+      if(now - g_PendingExecPostAttachMs < (uint)POST_ATTACH_DELAY_MS) return;
+
+      // Ensure sync mode for all modifications from this point
+      trade.SetAsyncMode(false);
+
+      // Deferred SL/TP attachment — replaces the old Sleep(250)+PostFillAttachSLTP
+      if(g_PendingExecSL > 0.0 || g_PendingExecTP > 0.0)
+         PostFillAttachSLTP(g_PendingExecBatchID, g_PendingExecDir);
+
+      // Finalize batch record
+      int batchIndex = FindBatchIndex(g_PendingExecBatchID);
+      if(batchIndex >= 0)
         {
-         price    = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
-         sl_price = (g_PanelSL > 0)
-                    ? NormalizeDouble(price - g_PanelSL * pip, _Digits) : 0;
-         tp_price = (g_PanelTP > 0)
-                    ? NormalizeDouble(price + g_PanelTP * pip, _Digits) : 0;
+         g_Batches[batchIndex].filled  = g_PendingExecDispatched;
+         g_Batches[batchIndex].errors  = g_PendingExecErrors;
+         g_Batches[batchIndex].partial = (g_PendingExecDispatched > 0 &&
+                                          g_PendingExecDispatched <
+                                          g_Batches[batchIndex].requested);
+         if(g_PendingExecDispatched <= 0)
+            RemoveBatch(g_PendingExecBatchID);
+        }
+
+      string dirStr  = (g_PendingExecDir == 0) ? "BUY" : "SELL";
+      string summary = dirStr+": "+IntegerToString(g_PendingExecDispatched)+
+                       "/"+IntegerToString(g_PendingExecTotal)+" dispatched";
+      if(g_PendingExecErrors > 0)
+         summary += " ("+IntegerToString(g_PendingExecErrors)+" errors)";
+
+      SetStatus(summary, (g_PendingExecErrors == 0) ? CLR_STATUS_OK : CLR_STATUS_WARN);
+      LogEvent("EXEC_SUMMARY", summary);
+
+      UnlockButtons();
+      g_IsExecuting           = false;
+      g_PendingExecPostAttach = false;
+      ReleaseExecState(EXEC_EXECUTING);
+      return;
+     }
+
+   //=================================================================
+   //  PHASE 1 — burst dispatch
+   //=================================================================
+   if(!g_PendingExecActive) return;
+
+   //--- Disconnect guard
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      trade.SetAsyncMode(false);
+      if(g_PendingExecDispatched <= 0)
+        {
+         // Nothing sent — fully abort and clean up
+         int batchIndex = FindBatchIndex(g_PendingExecBatchID);
+         if(batchIndex >= 0) RemoveBatch(g_PendingExecBatchID);
+         SetStatus("Disconnected during execution. Aborted.", CLR_STATUS_ERROR);
+         LogEvent("BURST_ABORT", "Disconnect pre-dispatch batchID="+
+                  IntegerToString(g_PendingExecBatchID));
+         UnlockButtons();
+         g_IsExecuting       = false;
+         g_PendingExecActive = false;
+         ReleaseExecState(EXEC_EXECUTING);
         }
       else
         {
-         price    = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-         sl_price = (g_PanelSL > 0)
-                    ? NormalizeDouble(price + g_PanelSL * pip, _Digits) : 0;
-         tp_price = (g_PanelTP > 0)
-                    ? NormalizeDouble(price - g_PanelTP * pip, _Digits) : 0;
+         // Some orders sent — transition to post-attach; reconnect resync handles rest
+         LogEvent("BURST_ABORT", "Disconnect mid-burst. Transitioning to post-attach. dispatched="+
+                  IntegerToString(g_PendingExecDispatched));
+         g_PendingExecActive      = false;
+         g_PendingExecPostAttach  = true;
+         g_PendingExecPostAttachMs= now;
         }
+      return;
+     }
 
-      sl_price = EnforceStopsLevel(Symbol(), price, sl_price, direction, false);
-      tp_price = EnforceStopsLevel(Symbol(), price, tp_price, direction, true);
+   //--- Burst time gate — enforces BURST_COOLDOWN_MS between windows
+   if(g_PendingExecLastBurstMs != 0 &&
+      now - g_PendingExecLastBurstMs < (uint)BURST_COOLDOWN_MS)
+      return;
 
-      string cmt = "MOE_"+IntegerToString(batchID)+"_"+IntegerToString(i);
-      trade.SetExpertMagicNumber(batchID);
+   g_PendingExecLastBurstMs = now;
 
-      double marginPer2 = 0.0;
-      if(!OrderCalcMargin(oType, Symbol(), lot, price, marginPer2) ||
-         AccountInfoDouble(ACCOUNT_MARGIN_FREE) < marginPer2 * 1.1)
+   //--- Per-burst margin check
+   ENUM_ORDER_TYPE oType = (g_PendingExecDir == 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   double checkPrice = (g_PendingExecDir == 0)
+      ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
+      : SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double marginPer  = 0.0;
+   int    remaining  = g_PendingExecTotal - g_PendingExecDispatched;
+   int    burstCount = MathMin(BURST_ORDER_LIMIT, remaining);
+
+   bool marginOk = OrderCalcMargin(oType, Symbol(), g_PendingExecLot,
+                                   checkPrice, marginPer);
+   if(!marginOk || marginPer <= 0.0 ||
+      AccountInfoDouble(ACCOUNT_MARGIN_FREE) < marginPer * burstCount * 1.1)
+     {
+      trade.SetAsyncMode(false);
+      LogEvent("BURST_ABORT", "Insufficient margin before burst dispatched="+
+               IntegerToString(g_PendingExecDispatched)+
+               " batchID="+IntegerToString(g_PendingExecBatchID));
+      g_PendingExecActive      = false;
+      g_PendingExecPostAttach  = true;
+      g_PendingExecPostAttachMs= now;
+      return;
+     }
+
+   //--- Enable async mode for burst dispatch window ONLY
+   trade.SetAsyncMode(true);
+   trade.SetExpertMagicNumber(g_PendingExecBatchID);
+
+   string dirStr    = (g_PendingExecDir == 0) ? "BUY" : "SELL";
+   bool   fatalError= false;
+
+   //--- Fire burst
+   for(int i = 0; i < burstCount; i++)
+     {
+      if(g_AbortFlag || g_IsDeinitializing ||
+         !TerminalInfoInteger(TERMINAL_CONNECTED))
         {
-         errors++;
-         LogEvent("EXEC_FAIL", "Insufficient margin mid-loop at order "+
-                  IntegerToString(i)+" batch="+IntegerToString(batchID));
+         LogEvent("BURST_INTERRUPT", "Abort/disconnect in burst loop order="+
+                  IntegerToString(g_PendingExecDispatched + 1));
+         fatalError = true;
          break;
         }
 
-      uint rc = 0;
-      bool sent = SendMarketOrderSafe(direction, lot, price,
-                                     sl_price, tp_price, cmt, rc);
+      int    orderNum = g_PendingExecDispatched + 1;
+      string cmt      = "MOE_"+IntegerToString(g_PendingExecBatchID)+
+                        "_"+IntegerToString(orderNum);
+      uint   rc       = 0;
+      bool   sent     = DispatchOrderNow(g_PendingExecDir, g_PendingExecLot, cmt, rc);
 
       if(sent)
         {
-         filled++;
-         if(filled == 1)
-            UpdateBatchStops(batchID, sl_price, tp_price);
+         g_PendingExecDispatched++;
+         if(g_PendingExecDispatched == 1)
+            UpdateBatchStops(g_PendingExecBatchID,
+                             g_PendingExecBatchSLPrice,
+                             g_PendingExecBatchTPPrice);
         }
       else if(rc == TRADE_RETCODE_NO_MONEY       ||
               rc == TRADE_RETCODE_LIMIT_ORDERS    ||
@@ -972,49 +1193,44 @@ void ExecuteOrders(int direction)
               rc == TRADE_RETCODE_MARKET_CLOSED   ||
               rc == TRADE_RETCODE_CONNECTION)
         {
-         errors++;
-         LogEvent("EXEC_FAIL", "Fatal retcode="+IntegerToString((int)rc)+
-                  " at order "+IntegerToString(i)+
-                  " batch="+IntegerToString(batchID));
+         g_PendingExecErrors++;
+         LogEvent("BURST_FATAL", "rc="+IntegerToString((int)rc)+
+                  " order="+IntegerToString(orderNum)+
+                  " batch="+IntegerToString(g_PendingExecBatchID));
+         fatalError = true;
          break;
         }
       else
         {
-         LogTradeFailure("ORDER", rc, 0, trade.ResultComment());
-         errors++;
+         // Non-fatal (e.g. 10027 TOO_MANY_REQUESTS, requote): log and continue.
+         // If 10027 is frequent, reduce BURST_ORDER_LIMIT or increase BURST_COOLDOWN_MS.
+         LogTradeFailure("BURST_ORDER_"+IntegerToString(orderNum),
+                         rc, 0, trade.ResultComment());
+         g_PendingExecErrors++;
         }
-
-      if(i % 5 == 0)
-         SetStatus("Executing "+dirStr+": "+IntegerToString(i)+
-                   "/"+IntegerToString(numToOpen), CLR_STATUS_EXEC);
      }
 
-   //--- 7. POST-FILL SL/TP ATTACH
-   if(g_PanelSL > 0.0 || g_PanelTP > 0.0)
-      PostFillAttachSLTP(batchID, direction);
+   //--- Restore sync mode immediately — never leave async mode on after burst
+   trade.SetAsyncMode(false);
 
-   int batchIndex = FindBatchIndex(batchID);
-   if(batchIndex >= 0)
+   // Update UI
+   SetStatus("Executing "+dirStr+": "+IntegerToString(g_PendingExecDispatched)+
+             "/"+IntegerToString(g_PendingExecTotal), CLR_STATUS_EXEC);
+
+   LogEvent("BURST_TICK", "dispatched="+IntegerToString(g_PendingExecDispatched)+
+            " total="+IntegerToString(g_PendingExecTotal)+
+            " errors="+IntegerToString(g_PendingExecErrors)+
+            " fatal="+IntegerToString(fatalError ? 1 : 0));
+
+   // Transition to Phase 2 if all dispatched or fatally aborted
+   if(fatalError || g_PendingExecDispatched >= g_PendingExecTotal)
      {
-      g_Batches[batchIndex].filled  = filled;
-      g_Batches[batchIndex].errors  = errors;
-      g_Batches[batchIndex].partial = (filled > 0 &&
-                                       filled < g_Batches[batchIndex].requested);
-      if(filled <= 0)
-         RemoveBatch(batchID);
+      g_PendingExecActive      = false;
+      g_PendingExecPostAttach  = true;
+      g_PendingExecPostAttachMs= GetTickCount();
+      LogEvent("BURST_COMPLETE", "dispatched="+IntegerToString(g_PendingExecDispatched)+
+               " moving to post-attach phase");
      }
-
-   string summary = dirStr+": "+IntegerToString(filled)+
-                    "/"+IntegerToString(numToOpen)+" filled";
-   if(errors > 0)
-      summary += " ("+IntegerToString(errors)+" errors)";
-
-   SetStatus(summary, (errors == 0) ? CLR_STATUS_OK : CLR_STATUS_WARN);
-   LogEvent("EXEC_SUMMARY", summary);
-
-   UnlockButtons();
-   g_IsExecuting = false;
-   ReleaseExecState(EXEC_EXECUTING);
   }
 
 //+------------------------------------------------------------------+
@@ -1022,7 +1238,8 @@ void ExecuteOrders(int direction)
 //+------------------------------------------------------------------+
 void PostFillAttachSLTP(long batchID, int direction)
   {
-   Sleep(250);
+   // v4.08: Sleep(250) removed — ProcessExecutionBurst uses POST_ATTACH_DELAY_MS
+   // timer-gated wait to allow async fills to settle before this runs.
    double pip = GetPipSize();
    int batchIndex = FindBatchIndex(batchID);
    if(batchIndex >= 0)
@@ -1073,7 +1290,7 @@ void PostFillAttachSLTP(long batchID, int direction)
   }
 
 //+------------------------------------------------------------------+
-//| RepairMissingSLTP — C-002 fix                                     |
+//| RepairMissingSLTP — C-002 fix                                    |
 //+------------------------------------------------------------------+
 void RepairMissingSLTP()
   {
@@ -1259,7 +1476,7 @@ bool BackupSyncCheck()
   }
 
 //+------------------------------------------------------------------+
-//| Batch navigation                                                  |
+//| Batch navigation                                                 |
 //+------------------------------------------------------------------+
 void SelectPreviousBatch()
   {
@@ -1313,7 +1530,6 @@ void CloseSelectedBatch()
    RefreshPanel();
   }
 
-// v4.07: improved breakeven feedback via GetBreakevenSkipReason
 void BreakevenSelectedBatch()
   {
    g_AbortFlag = false;
@@ -1340,7 +1556,7 @@ void PartialCloseSelectedBatch()
   }
 
 //+------------------------------------------------------------------+
-//| ToggleTrailing — v4.07                                            |
+//| ToggleTrailing — v4.07                                           |
 //+------------------------------------------------------------------+
 void ToggleTrailing()
   {
@@ -1350,7 +1566,6 @@ void ToggleTrailing()
       return;
      }
    g_TrailingEnabled = !g_TrailingEnabled;
-   // Propagate to all active batches
    for(int i = 0; i < ArraySize(g_Batches); i++)
       g_Batches[i].trailing = g_TrailingEnabled;
    SavePanelLayout();
@@ -1365,7 +1580,7 @@ void ToggleTrailing()
   }
 
 //+------------------------------------------------------------------+
-//| CloseAllBatch                                                     |
+//| CloseAllBatch                                                    |
 //+------------------------------------------------------------------+
 bool CloseAllBatch(long magic)
   {
@@ -1421,7 +1636,7 @@ bool CloseAllBatch(long magic)
   }
 
 //+------------------------------------------------------------------+
-//| BreakevenBatch                                                    |
+//| BreakevenBatch                                                   |
 //+------------------------------------------------------------------+
 int BreakevenBatch(long magic)
   {
@@ -1495,7 +1710,7 @@ int BreakevenBatch(long magic)
   }
 
 //+------------------------------------------------------------------+
-//| GetBreakevenSkipReason — v4.07                                    |
+//| GetBreakevenSkipReason — v4.07                                   |
 //+------------------------------------------------------------------+
 string GetBreakevenSkipReason(long magic)
   {
@@ -1519,7 +1734,7 @@ string GetBreakevenSkipReason(long magic)
          double trigPx = openPx + BreakevenTrigger * pip;
          double beSL   = NormalizeDouble(openPx + BreakevenBuffer * pip, _Digits);
          double bid    = SymbolInfoDouble(sym, SYMBOL_BID);
-         if(bid < trigPx)            notTriggered++;
+         if(bid < trigPx)               notTriggered++;
          else if(curSL >= beSL - drift) alreadyBE++;
         }
       else
@@ -1527,7 +1742,7 @@ string GetBreakevenSkipReason(long magic)
          double trigPx = openPx - BreakevenTrigger * pip;
          double beSL   = NormalizeDouble(openPx - BreakevenBuffer * pip, _Digits);
          double ask    = SymbolInfoDouble(sym, SYMBOL_ASK);
-         if(ask > trigPx)                        notTriggered++;
+         if(ask > trigPx)                           notTriggered++;
          else if(curSL > 0.0 && curSL <= beSL + drift) alreadyBE++;
         }
      }
@@ -1540,7 +1755,7 @@ string GetBreakevenSkipReason(long magic)
   }
 
 //+------------------------------------------------------------------+
-//| BatchTotalLots — v4.07                                            |
+//| BatchTotalLots — v4.07                                           |
 //+------------------------------------------------------------------+
 double BatchTotalLots(long magic, string symbol)
   {
@@ -1555,7 +1770,7 @@ double BatchTotalLots(long magic, string symbol)
   }
 
 //+------------------------------------------------------------------+
-//| IsBatchBreakevenActive — v4.07                                    |
+//| IsBatchBreakevenActive — v4.07                                   |
 //+------------------------------------------------------------------+
 bool IsBatchBreakevenActive(long magic, string symbol)
   {
@@ -1574,7 +1789,7 @@ bool IsBatchBreakevenActive(long magic, string symbol)
   }
 
 //+------------------------------------------------------------------+
-//| PartialCloseBatch                                                 |
+//| PartialCloseBatch                                                |
 //+------------------------------------------------------------------+
 int PartialCloseBatch(long magic)
   {
@@ -1627,7 +1842,7 @@ int PartialCloseBatch(long magic)
   }
 
 //+------------------------------------------------------------------+
-//| ProcessTrailing                                                   |
+//| ProcessTrailing                                                  |
 //+------------------------------------------------------------------+
 void ProcessTrailing()
   {
@@ -1677,10 +1892,7 @@ void ProcessTrailingBatch(long magic)
          double newTrail = NormalizeDouble(bid - trailDist, _Digits);
          newTrail = EnforceStopsLevel(batchSymbol, bid, newTrail, 0, false);
 
-         // v4.07 C-AUDIT-002 fix: if a pending queued modify for this ticket
-         // carries a BETTER (higher for BUY) SL target than newTrail, skip this
-         // trailing tick to prevent the deduplication overwrite from discarding
-         // a pending manual sync or repair intention.
+         // C-AUDIT-002 fix: skip if pending queue has a better SL
          int pendingIdx = FindQueuedModifyIndex(posInfo.Ticket());
          if(pendingIdx >= 0 &&
             g_ModifyQueue[pendingIdx].sl > 0.0 &&
@@ -1701,8 +1913,7 @@ void ProcessTrailingBatch(long magic)
          double newTrail = NormalizeDouble(ask + trailDist, _Digits);
          newTrail = EnforceStopsLevel(batchSymbol, ask, newTrail, 1, false);
 
-         // v4.07 C-AUDIT-002 fix: if a pending queued modify carries a BETTER
-         // (lower for SELL) SL target, skip this trailing tick.
+         // C-AUDIT-002 fix: skip if pending queue has a better SL
          int pendingIdx = FindQueuedModifyIndex(posInfo.Ticket());
          if(pendingIdx >= 0 &&
             g_ModifyQueue[pendingIdx].sl > 0.0 &&
@@ -1730,7 +1941,7 @@ void ProcessTrailingBatch(long magic)
   }
 
 //+------------------------------------------------------------------+
-//| HELPER FUNCTIONS                                                  |
+//| HELPER FUNCTIONS                                                 |
 //+------------------------------------------------------------------+
 
 void LogEvent(string tag, string message)
@@ -1842,7 +2053,6 @@ bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
    uint now = GetTickCount();
    if(idx >= 0)
      {
-      // Update existing entry (deduplication)
       g_ModifyQueue[idx].sl            = sl;
       g_ModifyQueue[idx].tp            = tp;
       g_ModifyQueue[idx].context       = context;
@@ -1850,7 +2060,6 @@ bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
       return true;
      }
 
-   // v4.07 M-AUDIT-001: enforce hard queue size cap to prevent unbounded growth
    int s = ArraySize(g_ModifyQueue);
    if(s >= MAX_MODIFY_QUEUE_SIZE)
      {
@@ -1869,7 +2078,6 @@ bool EnqueueModifyRequest(ulong ticket, double sl, double tp, string context)
    req.requestedAtMs = now;
    if(ArrayResize(g_ModifyQueue, s+1) != s+1) return false;
    g_ModifyQueue[s] = req;
-   // v4.07 M-AUDIT-002: g_ModifyTotalEnqueued replaces the removed g_ModifyQueuedCount
    g_ModifyTotalEnqueued++;
    return true;
   }
@@ -2026,11 +2234,14 @@ void ReleaseExecState(int expected)
      }
    else if(g_ExecStateStartMs > 0 && now - g_ExecStateStartMs > timeout)
      {
-      // C-001 fix: force-release clears g_IsExecuting and UI locks when stuck
-      // in EXEC_EXECUTING to prevent permanent execution blackout.
+      // C-001 fix: force-release clears g_IsExecuting and UI locks when stuck.
+      // v4.08: also resets burst dispatcher state and restores sync mode.
       if(g_ExecState == EXEC_EXECUTING)
         {
-         g_IsExecuting = false;
+         g_IsExecuting           = false;
+         g_PendingExecActive     = false;
+         g_PendingExecPostAttach = false;
+         trade.SetAsyncMode(false);
          UnlockButtons();
         }
       LogEvent("EXEC_FORCE_RELEASE",
@@ -2055,7 +2266,7 @@ string ExecStateText(int state)
   }
 
 //+------------------------------------------------------------------+
-//| DiagnosticsTick — v4.07: g_ModifyTotalEnqueued, trailing state   |
+//| DiagnosticsTick                                                  |
 //+------------------------------------------------------------------+
 void DiagnosticsTick()
   {
@@ -2084,6 +2295,8 @@ void DiagnosticsTick()
             " modOk="+IntegerToString(g_ModifySuccessCount)+
             " modFail="+IntegerToString(g_ModifyFailCount)+
             " trailing="+IntegerToString(g_TrailingEnabled ? 1 : 0)+
+            " burstDispatched="+IntegerToString(g_PendingExecDispatched)+
+            " burstTotal="+IntegerToString(g_PendingExecTotal)+
             " tSkip="+IntegerToString(g_TimerSkipCount)+
             " sSkip="+IntegerToString(g_SyncSkipCount)+
             " trSkip="+IntegerToString(g_TrailSkipCount)+
@@ -2410,7 +2623,6 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
    return false;
   }
 
-// Fix 4: retry cooldown check before close-count accounting (partial)
 bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
                               string context)
   {
@@ -2694,7 +2906,6 @@ void RebuildBatchRegistryFromPositions()
          batch.sl        = posInfo.StopLoss();
          batch.tp        = posInfo.TakeProfit();
          batch.syncing   = false;
-         // v4.07: trailing respects both config and runtime toggle
          batch.trailing  = (TrailingStop > 0.0) && g_TrailingEnabled;
          batch.active    = true;
          batch.created   = opened;
@@ -3037,7 +3248,6 @@ bool IsMouseOverPanelRect(int x, int y, int lx, int ly, int w, int h)
    return (x >= left && x <= left + w && y >= top && y <= top + h);
   }
 
-// v4.07: UpdateHoverState with trailing button hover support
 void UpdateHoverState(int x, int y)
   {
    if(g_IsExecuting || g_PanelMinimized) return;
@@ -3094,7 +3304,6 @@ void LoadPanelLayout()
       g_PanelTop   = (int)MathMax(0.0, GlobalVariableGet("MOE_PANEL_TOP"));
    if(GlobalVariableCheck("MOE_PANEL_MIN"))
       g_PanelMinimized = (GlobalVariableGet("MOE_PANEL_MIN") > 0.5);
-   // v4.07: restore trailing toggle state
    if(GlobalVariableCheck("MOE_PANEL_TRAIL") && TrailingStop > 0.0)
       g_TrailingEnabled = (GlobalVariableGet("MOE_PANEL_TRAIL") > 0.5);
   }
@@ -3104,7 +3313,6 @@ void SavePanelLayout()
    GlobalVariableSet("MOE_PANEL_RIGHT", (double)g_PanelRight);
    GlobalVariableSet("MOE_PANEL_TOP",   (double)g_PanelTop);
    GlobalVariableSet("MOE_PANEL_MIN",   g_PanelMinimized ? 1.0 : 0.0);
-   // v4.07: persist trailing toggle state
    GlobalVariableSet("MOE_PANEL_TRAIL", g_TrailingEnabled ? 1.0 : 0.0);
   }
 
@@ -3233,7 +3441,7 @@ void SetStatus(string msg, color clr)
   }
 
 //+------------------------------------------------------------------+
-//| RefreshTrailingButton — v4.07                                     |
+//| RefreshTrailingButton                                             |
 //+------------------------------------------------------------------+
 void RefreshTrailingButton()
   {
@@ -3334,7 +3542,7 @@ void SetManagementButtonsEnabled(bool enabled)
   }
 
 //+------------------------------------------------------------------+
-//| RefreshBatchPanel — v4.07: lots, trailing state, BE state        |
+//| RefreshBatchPanel                                                |
 //+------------------------------------------------------------------+
 void RefreshBatchPanel()
   {
@@ -3390,13 +3598,11 @@ void RefreshBatchPanel()
                    "P/L: "+pnlSign+"$"+DoubleToString(pnl, 2));
    ObjectSetInteger(0, P+"BPNL", OBJPROP_COLOR, pnlClr);
 
-   // v4.07: trailing state
    ObjectSetString(0,  P+"BTRAIL", OBJPROP_TEXT,
                    trailActive ? "Trail: ON" : "Trail: OFF");
    ObjectSetInteger(0, P+"BTRAIL", OBJPROP_COLOR,
                     trailActive ? CLR_STATUS_OK : CLR_SUBTLE);
 
-   // v4.07: breakeven state
    ObjectSetString(0,  P+"BBE", OBJPROP_TEXT,
                    beActive ? "BE: YES" : "BE: NO");
    ObjectSetInteger(0, P+"BBE", OBJPROP_COLOR,
@@ -3487,42 +3693,13 @@ void MakeRect(string name, int lx, int ly, int w, int h,
   }
 
 //+------------------------------------------------------------------+
-//| CreatePanel — v4.07 full redesign                                |
-//|                                                                   |
-//| Layout (Y from panel top):                                        |
-//|   0-70:  Title bar                                                |
-//|   84-164: Live info box                                           |
-//|   172:   DIV1                                                     |
-//|   184:   "ORDER SETUP"                                            |
-//|   204-248: Trades/Lots inputs                                     |
-//|   258-302: SL/TP inputs                                           |
-//|   308:   hint text                                                |
-//|   322:   DIV2                                                     |
-//|   336-380: BUY/SELL buttons (h=44)                                |
-//|   390:   DIV3                                                     |
-//|   402-434: TRAILING toggle (h=32)                                 |
-//|   444:   trailing info text                                       |
-//|   462:   DIV4                                                     |
-//|   474-506: CLOSE (h=32)                                           |
-//|   514-546: BREAKEVEN (h=32)                                       |
-//|   554-586: PARTIAL CLOSE (h=32)                                   |
-//|   596:   DIV5                                                     |
-//|   608:   "ACTIVE BATCH"                                           |
-//|   626-654: nav row                                                |
-//|   664:   meta line (symbol/dir/pos)                               |
-//|   680:   lots + PnL line                                          |
-//|   696:   trailing/BE state line                                   |
-//|   714:   DIV6                                                     |
-//|   718-774: status bar                                             |
-//|   PH = 774                                                        |
+//| CreatePanel — v4.07 layout, v4.08 version label                  |
 //+------------------------------------------------------------------+
 void CreatePanel()
   {
-   // Main background
    MakeRect(P+"BG", 0, 0, PW, g_PanelMinimized ? PH_MIN : PH, CLR_BG, CLR_BORDER);
    MakePanelDragHandle(P+"BG");
 
-   // Title bar
    MakeRect(P+"TBAR", 0, 0, PW, PH_MIN, CLR_SURFACE, CLR_BORDER);
    MakePanelDragHandle(P+"TBAR");
    MakeText(P+"TITLE", 16, 14, "APEX EXECUTION", CLR_TEXT, 12, true);
@@ -3540,23 +3717,19 @@ void CreatePanel()
       return;
      }
 
-   // ── Live info box ────────────────────────────────────────────────
    MakeRect(P+"LIVE", 12, 84, PW-24, 80, C'18,21,30', CLR_DIVIDER);
    MakeText(P+"SPREAD", 22,  98, "Spread  --",        CLR_STATUS_OK, 9, true);
    MakeText(P+"BAL",    22, 122, "Bal --",             CLR_MUTED,     8, false);
    MakeText(P+"POS",    22, 146, "Positions  0 / 200", CLR_MUTED,     8, false);
 
-   // ── Divider + ORDER SETUP ────────────────────────────────────────
    MakeRect(P+"DIV1", 12, 172, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
    MakeText(P+"SEC1", 16, 184, "ORDER SETUP", CLR_SUBTLE, 8, true);
 
-   // Inputs row 1: Trades / Lots
    MakeText(P+"L_NUM", 16,  204, "TRADES",           CLR_MUTED, 7, true);
    MakeEdit(P+"E_NUM", 16,  220, 170, IntegerToString(g_PanelNumTrades));
    MakeText(P+"L_LOT", 214, 204, "LOTS",             CLR_MUTED, 7, true);
    MakeEdit(P+"E_LOT", 214, 220, 170, DoubleToString(g_PanelLotSize, 2));
 
-   // Inputs row 2: SL / TP
    MakeText(P+"L_SL",  16,  258, "STOP LOSS PIPS",   CLR_MUTED, 7, true);
    MakeEdit(P+"E_SL",  16,  274, 170, "");
    ApplyOptionalEditValue(P+"E_SL", g_PanelSL, SL_PLACEHOLDER);
@@ -3565,19 +3738,15 @@ void CreatePanel()
    ApplyOptionalEditValue(P+"E_TP", g_PanelTP, TP_PLACEHOLDER);
    MakeText(P+"H_SLTP", 16, 308, "Blank = No SL / TP", CLR_SUBTLE, 7, false);
 
-   // ── Divider 2 ────────────────────────────────────────────────────
    MakeRect(P+"DIV2", 12, 322, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   // ── BUY / SELL buttons ───────────────────────────────────────────
    MakeButton(P+"BUY",  BUY_X,  BUY_Y,  BUY_W,  BUY_H,
               "BUY  F1",  CLR_BUY,  clrWhite);
    MakeButton(P+"SELL", SELL_X, SELL_Y, SELL_W, SELL_H,
               "SELL  F2", CLR_SELL, clrWhite);
 
-   // ── Divider 3 ────────────────────────────────────────────────────
    MakeRect(P+"DIV3", 12, 390, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   // ── TRAILING toggle button (v4.07) ───────────────────────────────
    {
       color trailBg  = CLR_TRAIL_DIS;
       color trailFg  = C'90,90,90';
@@ -3593,7 +3762,6 @@ void CreatePanel()
                  trailTxt, trailBg, trailFg);
    }
 
-   // Trailing info label
    {
       string tinfo = (TrailingStop > 0.0)
                      ? "Trail: "+DoubleToString(TrailingStop,0)+" pips   "+
@@ -3604,10 +3772,8 @@ void CreatePanel()
       MakeText(P+"TINFO", 22, 444, tinfo, tinfoClr, 8, false);
    }
 
-   // ── Divider 4 ────────────────────────────────────────────────────
    MakeRect(P+"DIV4", 12, 462, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   // ── Management buttons ───────────────────────────────────────────
    MakeButton(P+"CLOSE", 16, 474, 368, 32,
               "CLOSE SELECTED  F3",    CLR_CLOSE, clrWhite);
    MakeButton(P+"BE",    16, 514, 368, 32,
@@ -3616,27 +3782,22 @@ void CreatePanel()
               "PARTIAL CLOSE  "+DoubleToString(PartialClosePct, 0)+"%",
               CLR_PART, clrWhite);
 
-   // ── Divider 5 ────────────────────────────────────────────────────
    MakeRect(P+"DIV5", 12, 596, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   // ── Active batch section ─────────────────────────────────────────
    MakeText(P+"SEC2",  16, 608, "ACTIVE BATCH", CLR_SUBTLE, 8, true);
 
    MakeButton(P+"BPREV", 16,  626, 42, 28, "<", CLR_SURFACE, CLR_TEXT);
    MakeButton(P+"BNEXT", 342, 626, 42, 28, ">", CLR_SURFACE, CLR_TEXT);
    MakeText(P+"BSEL",  70, 631, "No Active Batches", clrOrange, 8, true);
 
-   // Batch info lines
    MakeText(P+"BMETA",  16,  664, "Symbol --   Pos 0",  CLR_MUTED, 8, false);
    MakeText(P+"BLOTS",  16,  680, "Lots: --",            CLR_MUTED, 8, false);
    MakeText(P+"BPNL",   200, 680, "P/L: --",             CLR_MUTED, 8, true);
    MakeText(P+"BTRAIL", 16,  696, "Trail: --",           CLR_MUTED, 8, false);
    MakeText(P+"BBE",    190, 696, "BE: --",              CLR_MUTED, 8, false);
 
-   // ── Divider 6 ────────────────────────────────────────────────────
    MakeRect(P+"DIV6", 12, 714, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
 
-   // ── Status bar ───────────────────────────────────────────────────
    MakeRect(P+"SBAR",   0,   718, PW, 56,  CLR_SURFACE, CLR_BORDER);
    MakeText(P+"SLAB",  16,  726, "STATUS",  CLR_SUBTLE,    7, true);
    MakeText(P+"STATUS",16,  742, "Ready",   CLR_STATUS_OK, 9, true);
@@ -3646,7 +3807,7 @@ void CreatePanel()
   }
 
 //+------------------------------------------------------------------+
-//| DeletePanel                                                       |
+//| DeletePanel                                                      |
 //+------------------------------------------------------------------+
 void DeletePanel()
   {
@@ -3654,9 +3815,3 @@ void DeletePanel()
    ChartRedraw();
   }
 //+------------------------------------------------------------------+
-
-
-
-
-
-
