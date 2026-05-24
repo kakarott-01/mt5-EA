@@ -165,6 +165,9 @@ bool    g_TrailingEnabled        = true;
 bool    g_HoverBuy               = false;
 bool    g_HoverSell              = false;
 bool    g_HoverTrail             = false;
+bool    g_HoverClose             = false;
+bool    g_HoverBE                = false;
+bool    g_HoverPart              = false;
 int     g_SelectedBatchIndex     = -1;
 int     g_PanelNumTrades         = 0;
 double  g_PanelLotSize           = 0;
@@ -251,23 +254,25 @@ const string SL_PLACEHOLDER = "50";
 const string TP_PLACEHOLDER = "100";
 const int    PR             = 36;
 const int    PT             = 45;
-const int    PW             = 400;
-const int    PH             = 774;
-const int    PH_MIN         = 70;
 
-const int    BUY_X          = 16;
-const int    BUY_Y          = 336;
-const int    BUY_W          = 176;
-const int    BUY_H          = 44;
-const int    SELL_X         = 208;
-const int    SELL_Y         = 336;
-const int    SELL_W         = 176;
-const int    SELL_H         = 44;
+// Responsive panel layout constants
+const int    PANEL_WIDTH       = 420;
+const int    PANEL_PADDING     = 16;
+const int    PANEL_GUTTER      = 10;
+const int    PANEL_MIN_HEIGHT  = 70;
+const int    HEADER_HEIGHT     = 68;
+const int    ROW_HEIGHT        = 22;
+const int    SECTION_GAP       = 12;
+const int    SECTION_HEAD_H    = 20;
+const int    BUTTON_HEIGHT     = 36;
+const int    FIELD_HEIGHT      = 28;
+const int    LABEL_WIDTH       = 118;
+const int    STATUS_BAR_HEIGHT = 56;
+const int    INPUT_COL_GAP     = 12;
 
-const int    TRAIL_X        = 16;
-const int    TRAIL_Y        = 402;
-const int    TRAIL_W        = 368;
-const int    TRAIL_H        = 32;
+// Backward-compatible aliases used by panel movement helpers.
+const int    PW             = PANEL_WIDTH;
+const int    PH_MIN         = PANEL_MIN_HEIGHT;
 
 // Core colors
 const color  CLR_BG          = C'14,16,22';
@@ -284,8 +289,11 @@ const color  CLR_BUY_HOVER   = C'0,190,125';
 const color  CLR_SELL        = C'180,60,60';
 const color  CLR_SELL_HOVER  = C'220,85,85';
 const color  CLR_CLOSE       = C'135,35,35';
+const color  CLR_CLOSE_HOVER = C'190,45,45';
 const color  CLR_BE          = C'25,95,150';
+const color  CLR_BE_HOVER    = C'40,135,205';
 const color  CLR_PART        = C'115,85,10';
+const color  CLR_PART_HOVER  = C'170,125,15';
 const color  CLR_PLACEHOLDER = C'110,115,130';
 
 const color  CLR_TRAIL_ON        = C'0,150,95';
@@ -308,6 +316,17 @@ bool g_PanelMinimized = false;
 bool g_PanelDragging  = false;
 int  g_DragOffsetX    = 0;
 int  g_DragOffsetY    = 0;
+int  g_PanelHeight    = 760;
+
+// Dynamic hitboxes for hover/click feedback.
+int  g_BuyX=0,   g_BuyY=0,   g_BuyW=0,   g_BuyH=0;
+int  g_SellX=0,  g_SellY=0,  g_SellW=0,  g_SellH=0;
+int  g_TrailX=0, g_TrailY=0, g_TrailW=0, g_TrailH=0;
+int  g_CloseX=0, g_CloseY=0, g_CloseW=0, g_CloseH=0;
+int  g_BeX=0,    g_BeY=0,    g_BeW=0,    g_BeH=0;
+int  g_PartX=0,  g_PartY=0,  g_PartW=0,  g_PartH=0;
+string g_StatusText = "Ready";
+color  g_StatusColor = CLR_STATUS_OK;
 
 int PX(int lx) { return g_PanelRight + PW - lx; }
 int PY(int ly) { return g_PanelTop + ly; }
@@ -3199,15 +3218,15 @@ ENUM_ORDER_TYPE_FILLING DetectFillingMode()
 
 void LockButtons()
   {
-   ObjectSetInteger(0, P+"BUY",  OBJPROP_BGCOLOR, C'55,55,55');
-   ObjectSetInteger(0, P+"SELL", OBJPROP_BGCOLOR, C'55,55,55');
+   SetButtonVisual(P+"BUY",  C'55,55,55', C'155,155,155');
+   SetButtonVisual(P+"SELL", C'55,55,55', C'155,155,155');
    ChartRedraw();
   }
 
 void UnlockButtons()
   {
-   ObjectSetInteger(0, P+"BUY",  OBJPROP_BGCOLOR, CLR_BUY);
-   ObjectSetInteger(0, P+"SELL", OBJPROP_BGCOLOR, CLR_SELL);
+   SetButtonVisual(P+"BUY",  CLR_BUY,  clrWhite);
+   SetButtonVisual(P+"SELL", CLR_SELL, clrWhite);
    ChartRedraw();
   }
 
@@ -3253,10 +3272,13 @@ void UpdateHoverState(int x, int y)
    if(g_IsExecuting || g_PanelMinimized) return;
    if(ObjectFind(0, P+"BUY") < 0 || ObjectFind(0, P+"SELL") < 0) return;
 
-   bool overBuy   = IsMouseOverPanelRect(x, y, BUY_X,   BUY_Y,   BUY_W,   BUY_H);
-   bool overSell  = IsMouseOverPanelRect(x, y, SELL_X,  SELL_Y,  SELL_W,  SELL_H);
+   bool overBuy   = IsMouseOverPanelRect(x, y, g_BuyX,   g_BuyY,   g_BuyW,   g_BuyH);
+   bool overSell  = IsMouseOverPanelRect(x, y, g_SellX,  g_SellY,  g_SellW,  g_SellH);
    bool overTrail = (TrailingStop > 0.0) &&
-                    IsMouseOverPanelRect(x, y, TRAIL_X, TRAIL_Y, TRAIL_W, TRAIL_H);
+                    IsMouseOverPanelRect(x, y, g_TrailX, g_TrailY, g_TrailW, g_TrailH);
+   bool overClose = IsMouseOverPanelRect(x, y, g_CloseX, g_CloseY, g_CloseW, g_CloseH);
+   bool overBE    = IsMouseOverPanelRect(x, y, g_BeX,    g_BeY,    g_BeW,    g_BeH);
+   bool overPart  = IsMouseOverPanelRect(x, y, g_PartX,  g_PartY,  g_PartW,  g_PartH);
    bool changed   = false;
 
    if(overBuy != g_HoverBuy)
@@ -3279,6 +3301,23 @@ void UpdateHoverState(int x, int y)
       RefreshTrailingButton();
       changed = true;
      }
+   if(overClose != g_HoverClose)
+     {
+      g_HoverClose = overClose;
+      changed = true;
+     }
+   if(overBE != g_HoverBE)
+     {
+      g_HoverBE = overBE;
+      changed = true;
+     }
+   if(overPart != g_HoverPart)
+     {
+      g_HoverPart = overPart;
+      changed = true;
+     }
+   if(changed)
+      SetManagementButtonsEnabled(ManagementButtonsAvailable());
    if(changed) ChartRedraw();
   }
 
@@ -3288,12 +3327,84 @@ string FitPanelText(string text, int maxLen)
    return StringSubstr(text, 0, maxLen-3)+"...";
   }
 
+int TextMaxChars(int pixels, int fontSize)
+  {
+   double charPx = MathMax(5.0, (double)fontSize * 0.62);
+   return (int)MathMax(4.0, MathFloor((double)pixels / charPx));
+  }
+
+string FitTextWidth(string text, int pixels, int fontSize)
+  {
+   return FitPanelText(text, TextMaxChars(pixels, fontSize));
+  }
+
+string FitMiddleText(string text, int pixels, int fontSize)
+  {
+   int maxLen = TextMaxChars(pixels, fontSize);
+   int len = StringLen(text);
+   if(len <= maxLen) return text;
+   if(maxLen <= 6) return FitPanelText(text, maxLen);
+   int right = (int)MathMax(3.0, (double)(maxLen / 2));
+   int left  = (int)MathMax(1.0, (double)(maxLen - right - 3));
+   return StringSubstr(text, 0, left)+"..."+StringSubstr(text, len-right, right);
+  }
+
 string ShortMagic(long magic)
   {
    string value = IntegerToString(magic);
    int len = StringLen(value);
    if(len <= 10) return value;
    return "..."+StringSubstr(value, len-8, 8);
+  }
+
+string ShortTicket(long magic, int pixels, int fontSize)
+  {
+   string full = "#"+IntegerToString(magic);
+   if(StringLen(full) <= TextMaxChars(pixels, fontSize)) return full;
+   string value = IntegerToString(magic);
+   int len = StringLen(value);
+   int keep = (int)MathMin(8.0, MathMax(4.0, (double)(TextMaxChars(pixels, fontSize)-4)));
+   int start = (int)MathMax(0.0, (double)(len-keep));
+   return "#..."+StringSubstr(value, start, keep);
+  }
+
+string CompactMoney(double value, int pixels, int fontSize)
+  {
+   string sign = (value >= 0.0) ? "+$" : "-$";
+   double absValue = MathAbs(value);
+   string txt = sign + DoubleToString(absValue, 2);
+   if(StringLen(txt) <= TextMaxChars(pixels, fontSize)) return txt;
+
+   txt = sign + DoubleToString(absValue, 0);
+   if(StringLen(txt) <= TextMaxChars(pixels, fontSize)) return txt;
+
+   if(absValue >= 1000000.0)
+      txt = sign + DoubleToString(absValue / 1000000.0, 2) + "M";
+   else if(absValue >= 1000.0)
+      txt = sign + DoubleToString(absValue / 1000.0, 1) + "K";
+   return FitTextWidth(txt, pixels, fontSize);
+  }
+
+int ContentWidth()
+  {
+   return PANEL_WIDTH - (PANEL_PADDING * 2);
+  }
+
+int CurrentPanelHeight()
+  {
+   return g_PanelMinimized ? PANEL_MIN_HEIGHT : g_PanelHeight;
+  }
+
+void UpdateLayout()
+  {
+   int y = HEADER_HEIGHT + SECTION_GAP;
+   y += SECTION_HEAD_H + (ROW_HEIGHT * 4) + SECTION_GAP;
+   y += SECTION_HEAD_H + (FIELD_HEIGHT * 2) + (ROW_HEIGHT * 2) + 18 + SECTION_GAP;
+   y += SECTION_HEAD_H + BUTTON_HEIGHT + PANEL_GUTTER + 18 + BUTTON_HEIGHT + 18 +
+        PANEL_GUTTER + (32 * 3) + (PANEL_GUTTER * 2) + SECTION_GAP;
+   y += SECTION_HEAD_H + 100 + SECTION_GAP;
+   y += STATUS_BAR_HEIGHT + PANEL_PADDING;
+   g_PanelHeight = (int)MathMax(740.0, (double)y);
   }
 
 void LoadPanelLayout()
@@ -3360,7 +3471,7 @@ void MovePanelTo(int newRight, int newTop)
   {
    int chartW = ChartWidthPixels();
    int chartH = ChartHeightPixels();
-   int panelH = g_PanelMinimized ? PH_MIN : PH;
+   int panelH = CurrentPanelHeight();
 
    if(chartW > PW)
       newRight = (int)MathMax(0.0, MathMin((double)(chartW-PW), (double)newRight));
@@ -3431,9 +3542,12 @@ void MakePanelDragHandle(string name)
 
 void SetStatus(string msg, color clr)
   {
+   g_StatusText  = msg;
+   g_StatusColor = clr;
    if(ObjectFind(0, P+"STATUS") >= 0)
      {
-      ObjectSetString(0,  P+"STATUS", OBJPROP_TEXT,  FitPanelText(msg, 46));
+      ObjectSetString(0,  P+"STATUS", OBJPROP_TEXT,
+                      FitTextWidth(msg, ContentWidth() - LABEL_WIDTH, 9));
       ObjectSetInteger(0, P+"STATUS", OBJPROP_COLOR, clr);
       ChartRedraw();
      }
@@ -3449,40 +3563,52 @@ void RefreshTrailingButton()
 
    if(TrailingStop <= 0.0)
      {
-      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT,   "TRAILING SL  ·  NOT CONFIGURED  F5");
+      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT,   "TRAILING STOP  OFF");
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_BGCOLOR, CLR_TRAIL_DIS);
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_COLOR,   C'90,90,90');
+      if(ObjectFind(0, P+"TSTAT") >= 0)
+        {
+         ObjectSetString(0,  P+"TSTAT", OBJPROP_TEXT, "OFF");
+         ObjectSetInteger(0, P+"TSTAT", OBJPROP_COLOR, CLR_SUBTLE);
+        }
       if(ObjectFind(0, P+"TINFO") >= 0)
         {
-         ObjectSetString(0,  P+"TINFO", OBJPROP_TEXT,  "Set TrailingStop > 0 in EA inputs to enable");
+         ObjectSetString(0,  P+"TINFO", OBJPROP_TEXT,  "Configure in inputs");
          ObjectSetInteger(0, P+"TINFO", OBJPROP_COLOR, CLR_SUBTLE);
         }
      }
    else if(g_TrailingEnabled)
      {
-      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT,
-                      "TRAILING SL  ·  ACTIVE  F5");
+      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT, "TRAILING STOP  ON");
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_BGCOLOR,
                        g_HoverTrail ? CLR_TRAIL_ON_HOVER : CLR_TRAIL_ON);
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_COLOR, clrWhite);
+      if(ObjectFind(0, P+"TSTAT") >= 0)
+        {
+         ObjectSetString(0,  P+"TSTAT", OBJPROP_TEXT, "ON");
+         ObjectSetInteger(0, P+"TSTAT", OBJPROP_COLOR, CLR_STATUS_OK);
+        }
       if(ObjectFind(0, P+"TINFO") >= 0)
         {
-         string info = "Trail: "+DoubleToString(TrailingStop,0)+" pips   "+
-                       "Step: "+DoubleToString(TrailingStep,0)+" pips";
+         string info = "Trailing: "+DoubleToString(TrailingStop,0)+" pips";
          ObjectSetString(0,  P+"TINFO", OBJPROP_TEXT,  info);
          ObjectSetInteger(0, P+"TINFO", OBJPROP_COLOR, CLR_STATUS_OK);
         }
      }
    else
      {
-      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT, "TRAILING SL  ·  OFF  F5");
+      ObjectSetString(0,  P+"TRAIL", OBJPROP_TEXT, "TRAILING STOP  OFF");
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_BGCOLOR,
                        g_HoverTrail ? CLR_TRAIL_OFF_HOVER : CLR_TRAIL_OFF);
       ObjectSetInteger(0, P+"TRAIL", OBJPROP_COLOR, CLR_MUTED);
+      if(ObjectFind(0, P+"TSTAT") >= 0)
+        {
+         ObjectSetString(0,  P+"TSTAT", OBJPROP_TEXT, "OFF");
+         ObjectSetInteger(0, P+"TSTAT", OBJPROP_COLOR, CLR_MUTED);
+        }
       if(ObjectFind(0, P+"TINFO") >= 0)
         {
-         string info = "Trail: "+DoubleToString(TrailingStop,0)+" pips   "+
-                       "Step: "+DoubleToString(TrailingStep,0)+" pips";
+         string info = "Trailing: "+DoubleToString(TrailingStop,0)+" pips";
          ObjectSetString(0,  P+"TINFO", OBJPROP_TEXT,  info);
          ObjectSetInteger(0, P+"TINFO", OBJPROP_COLOR, CLR_SUBTLE);
         }
@@ -3491,6 +3617,11 @@ void RefreshTrailingButton()
 
 void RefreshPanel()
   {
+   UpdateDynamicValues();
+  }
+
+void UpdateDynamicValues()
+  {
    if(ObjectFind(0, P+"SPREAD") < 0) return;
 
    double spdPips = (double)SymbolInfoInteger(Symbol(), SYMBOL_SPREAD)
@@ -3498,18 +3629,21 @@ void RefreshPanel()
    color spdClr   = (MaxSpread > 0 && spdPips > MaxSpread)
                     ? CLR_STATUS_WARN : CLR_STATUS_OK;
    ObjectSetString(0,  P+"SPREAD", OBJPROP_TEXT,
-                   "Spread  "+DoubleToString(spdPips, 1)+" pips");
+                   FitTextWidth(DoubleToString(spdPips, 1)+" pips", 210, 8));
    ObjectSetInteger(0, P+"SPREAD", OBJPROP_COLOR, spdClr);
 
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
    ObjectSetString(0, P+"BAL", OBJPROP_TEXT,
-                   "Bal $"+DoubleToString(bal,2)+"   Eq $"+DoubleToString(eq,2));
+                   FitTextWidth("$"+DoubleToString(bal,2), 210, 8));
+   if(ObjectFind(0, P+"EQ") >= 0)
+      ObjectSetString(0, P+"EQ", OBJPROP_TEXT,
+                      FitTextWidth("$"+DoubleToString(eq,2), 210, 8));
 
    int   pos    = PositionsTotal();
    color posClr = (pos >= 190) ? CLR_STATUS_WARN : CLR_MUTED;
    ObjectSetString(0,  P+"POS",  OBJPROP_TEXT,
-                   "Positions  "+IntegerToString(pos)+" / 200");
+                   IntegerToString(pos)+" / 200");
    ObjectSetInteger(0, P+"POS",  OBJPROP_COLOR, posClr);
 
    RefreshTrailingButton();
@@ -3529,16 +3663,22 @@ void SetManagementButtonsEnabled(bool enabled)
   {
    color disabledBg = C'45,45,45';
    color disabledFg = C'150,150,150';
-   SetButtonVisual(P+"CLOSE", enabled ? CLR_CLOSE   : disabledBg,
+   SetButtonVisual(P+"CLOSE", enabled ? (g_HoverClose ? CLR_CLOSE_HOVER : CLR_CLOSE) : disabledBg,
                               enabled ? clrWhite    : disabledFg);
-   SetButtonVisual(P+"BE",    enabled ? CLR_BE      : disabledBg,
+   SetButtonVisual(P+"BE",    enabled ? (g_HoverBE    ? CLR_BE_HOVER    : CLR_BE)    : disabledBg,
                               enabled ? clrWhite    : disabledFg);
-   SetButtonVisual(P+"PART",  enabled ? CLR_PART    : disabledBg,
+   SetButtonVisual(P+"PART",  enabled ? (g_HoverPart  ? CLR_PART_HOVER  : CLR_PART)  : disabledBg,
                               enabled ? clrWhite    : disabledFg);
    SetButtonVisual(P+"BPREV", enabled ? CLR_SURFACE : disabledBg,
                               enabled ? CLR_TEXT    : disabledFg);
    SetButtonVisual(P+"BNEXT", enabled ? CLR_SURFACE : disabledBg,
                               enabled ? CLR_TEXT    : disabledFg);
+  }
+
+bool ManagementButtonsAvailable()
+  {
+   int size = ArraySize(g_Batches);
+   return (size > 0 && g_SelectedBatchIndex >= 0 && g_SelectedBatchIndex < size);
   }
 
 //+------------------------------------------------------------------+
@@ -3552,17 +3692,21 @@ void RefreshBatchPanel()
    int size = ArraySize(g_Batches);
    if(size <= 0 || g_SelectedBatchIndex < 0 || g_SelectedBatchIndex >= size)
      {
-      ObjectSetString(0,  P+"BSEL",   OBJPROP_TEXT,  "No Active Batches");
+      ObjectSetString(0,  P+"BSEL",   OBJPROP_TEXT,  "No Active Batch");
       ObjectSetInteger(0, P+"BSEL",   OBJPROP_COLOR, clrOrange);
-      ObjectSetString(0,  P+"BMETA",  OBJPROP_TEXT,  "Symbol --   Pos 0");
+      ObjectSetString(0,  P+"BTICKET",OBJPROP_TEXT,  "#--");
+      ObjectSetInteger(0, P+"BTICKET",OBJPROP_COLOR, CLR_MUTED);
+      ObjectSetString(0,  P+"BMETA",  OBJPROP_TEXT,  "--");
       ObjectSetInteger(0, P+"BMETA",  OBJPROP_COLOR, CLR_MUTED);
-      ObjectSetString(0,  P+"BLOTS",  OBJPROP_TEXT,  "Lots: --");
+      ObjectSetString(0,  P+"BPOS",   OBJPROP_TEXT,  "0");
+      ObjectSetInteger(0, P+"BPOS",   OBJPROP_COLOR, CLR_MUTED);
+      ObjectSetString(0,  P+"BLOTS",  OBJPROP_TEXT,  "--");
       ObjectSetInteger(0, P+"BLOTS",  OBJPROP_COLOR, CLR_MUTED);
-      ObjectSetString(0,  P+"BPNL",   OBJPROP_TEXT,  "P/L: --");
+      ObjectSetString(0,  P+"BPNL",   OBJPROP_TEXT,  "--");
       ObjectSetInteger(0, P+"BPNL",   OBJPROP_COLOR, CLR_MUTED);
-      ObjectSetString(0,  P+"BTRAIL", OBJPROP_TEXT,  "Trail: --");
+      ObjectSetString(0,  P+"BTRAIL", OBJPROP_TEXT,  "--");
       ObjectSetInteger(0, P+"BTRAIL", OBJPROP_COLOR, CLR_MUTED);
-      ObjectSetString(0,  P+"BBE",    OBJPROP_TEXT,  "BE: --");
+      ObjectSetString(0,  P+"BBE",    OBJPROP_TEXT,  "--");
       ObjectSetInteger(0, P+"BBE",    OBJPROP_COLOR, CLR_MUTED);
       SetManagementButtonsEnabled(false);
       return;
@@ -3581,30 +3725,41 @@ void RefreshBatchPanel()
 
    ObjectSetString(0,  P+"BSEL", OBJPROP_TEXT,
                    "Batch "+IntegerToString(g_SelectedBatchIndex+1)+
-                   "/"+IntegerToString(size)+"   #"+ShortMagic(batch.magic));
+                   "/"+IntegerToString(size));
    ObjectSetInteger(0, P+"BSEL", OBJPROP_COLOR, CLR_TEXT);
 
+   if(ObjectFind(0, P+"BTICKET") >= 0)
+     {
+      ObjectSetString(0,  P+"BTICKET", OBJPROP_TEXT,
+                      ShortTicket(batch.magic, 150, 8));
+      ObjectSetInteger(0, P+"BTICKET", OBJPROP_COLOR, CLR_MUTED);
+     }
+
    ObjectSetString(0,  P+"BMETA", OBJPROP_TEXT,
-                   batch.symbol+"   "+BatchDirectionText(batch.direction)+
-                   "   Pos: "+IntegerToString(positions));
+                   FitTextWidth(batch.symbol+"  "+BatchDirectionText(batch.direction), 180, 8));
    ObjectSetInteger(0, P+"BMETA", OBJPROP_COLOR, CLR_MUTED);
 
+   if(ObjectFind(0, P+"BPOS") >= 0)
+     {
+      ObjectSetString(0,  P+"BPOS", OBJPROP_TEXT, IntegerToString(positions));
+      ObjectSetInteger(0, P+"BPOS", OBJPROP_COLOR, CLR_MUTED);
+     }
+
    ObjectSetString(0,  P+"BLOTS", OBJPROP_TEXT,
-                   "Lots: "+DoubleToString(lots, 2));
+                   FitTextWidth(DoubleToString(lots, 2), 100, 8));
    ObjectSetInteger(0, P+"BLOTS", OBJPROP_COLOR, CLR_MUTED);
 
-   string pnlSign = (pnl >= 0.0) ? "+" : "";
    ObjectSetString(0,  P+"BPNL", OBJPROP_TEXT,
-                   "P/L: "+pnlSign+"$"+DoubleToString(pnl, 2));
+                   CompactMoney(pnl, 150, 9));
    ObjectSetInteger(0, P+"BPNL", OBJPROP_COLOR, pnlClr);
 
    ObjectSetString(0,  P+"BTRAIL", OBJPROP_TEXT,
-                   trailActive ? "Trail: ON" : "Trail: OFF");
+                   trailActive ? "ON" : "OFF");
    ObjectSetInteger(0, P+"BTRAIL", OBJPROP_COLOR,
                     trailActive ? CLR_STATUS_OK : CLR_SUBTLE);
 
    ObjectSetString(0,  P+"BBE", OBJPROP_TEXT,
-                   beActive ? "BE: YES" : "BE: NO");
+                   beActive ? "YES" : "NO");
    ObjectSetInteger(0, P+"BBE", OBJPROP_COLOR,
                     beActive ? CLR_STATUS_OK : CLR_SUBTLE);
 
@@ -3625,6 +3780,7 @@ void MakeLabel(string name, int lx, int ly, string txt,
    ObjectSetString(0,  name, OBJPROP_FONT,       bold ? "Tahoma Bold" : "Tahoma");
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,     10);
   }
 
 void MakeText(string name, int lx, int ly, string txt,
@@ -3641,17 +3797,18 @@ void MakeEdit(string name, int lx, int ly, int w, string txt)
    ObjectSetInteger(0, name, OBJPROP_CORNER,       CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE,    PX(lx));
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE,    PY(ly));
-   ObjectSetInteger(0, name, OBJPROP_XSIZE,        w + 10);
-   ObjectSetInteger(0, name, OBJPROP_YSIZE,        28);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,        w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,        FIELD_HEIGHT);
    ObjectSetString(0,  name, OBJPROP_TEXT,         txt);
    ObjectSetInteger(0, name, OBJPROP_COLOR,        CLR_TEXT);
    ObjectSetInteger(0, name, OBJPROP_BGCOLOR,      CLR_EDIT_BG);
    ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, CLR_EDIT_BD);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,     10);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,     9);
    ObjectSetString(0,  name, OBJPROP_FONT,         "Tahoma");
    ObjectSetInteger(0, name, OBJPROP_ALIGN,        ALIGN_CENTER);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
    ObjectSetInteger(0, name, OBJPROP_BACK,         false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,       20);
   }
 
 void MakeButton(string name, int lx, int ly, int w, int h,
@@ -3673,6 +3830,7 @@ void MakeButton(string name, int lx, int ly, int w, int h,
    ObjectSetInteger(0, name, OBJPROP_STATE,        false);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
    ObjectSetInteger(0, name, OBJPROP_BACK,         false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,       30);
   }
 
 void MakeRect(string name, int lx, int ly, int w, int h,
@@ -3690,119 +3848,205 @@ void MakeRect(string name, int lx, int ly, int w, int h,
    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE,  BORDER_FLAT);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
    ObjectSetInteger(0, name, OBJPROP_BACK,         false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,       0);
+  }
+
+void MakeValue(string name, int lx, int ly, int w, string txt,
+               color clr, int sz, bool bold)
+  {
+   MakeLabel(name, lx + w, ly, FitTextWidth(txt, w, sz), clr, sz, bold);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+  }
+
+void MakeKeyValue(string labelName, string valueName, int lx, int ly,
+                  int labelW, int valueW, string label, string value)
+  {
+   MakeText(labelName, lx, ly, label, CLR_MUTED, 8, false);
+   MakeValue(valueName, lx + labelW, ly, valueW, value, CLR_TEXT, 8, true);
+  }
+
+int CreateSectionHeader(string name, int y, string title)
+  {
+   MakeText(name, PANEL_PADDING, y, title, CLR_SUBTLE, 8, true);
+   MakeRect(name+"_LINE", PANEL_PADDING, y + SECTION_HEAD_H - 3,
+            ContentWidth(), 1, CLR_DIVIDER, CLR_DIVIDER);
+   return y + SECTION_HEAD_H;
+  }
+
+int CreateHeader(int y)
+  {
+   MakeRect(P+"TBAR", 0, 0, PANEL_WIDTH, HEADER_HEIGHT, CLR_SURFACE, CLR_BORDER);
+   MakePanelDragHandle(P+"TBAR");
+   MakeText(P+"TITLE", PANEL_PADDING, 12, "APEX EXECUTION", CLR_TEXT, 12, true);
+   MakePanelDragHandle(P+"TITLE");
+   MakeText(P+"TSYM",  PANEL_PADDING, 39,
+            FitTextWidth(Symbol()+" | "+EnumToString((ENUM_TIMEFRAMES)Period()),
+                         PANEL_WIDTH - 74, 8),
+            CLR_MUTED, 8, true);
+   MakePanelDragHandle(P+"TSYM");
+   MakeButton(P+"MIN", PANEL_WIDTH - PANEL_PADDING - 30, 18, 30, 26,
+              g_PanelMinimized ? "+" : "-", CLR_SURFACE, CLR_TEXT);
+   return HEADER_HEIGHT + SECTION_GAP;
+  }
+
+int CreateAccountSection(int y)
+  {
+   y = CreateSectionHeader(P+"SEC_ACCOUNT", y, "ACCOUNT INFO");
+   int labelW = LABEL_WIDTH;
+   int valueW = ContentWidth() - labelW;
+   MakeKeyValue(P+"L_SPREAD", P+"SPREAD", PANEL_PADDING, y, labelW, valueW,
+                "Spread:", "--");
+   y += ROW_HEIGHT;
+   MakeKeyValue(P+"L_BAL", P+"BAL", PANEL_PADDING, y, labelW, valueW,
+                "Balance:", "--");
+   y += ROW_HEIGHT;
+   MakeKeyValue(P+"L_EQ", P+"EQ", PANEL_PADDING, y, labelW, valueW,
+                "Equity:", "--");
+   y += ROW_HEIGHT;
+   MakeKeyValue(P+"L_POS", P+"POS", PANEL_PADDING, y, labelW, valueW,
+                "Positions:", "0 / 200");
+   return y + ROW_HEIGHT + SECTION_GAP;
+  }
+
+int CreateTradeSection(int y)
+  {
+   y = CreateSectionHeader(P+"SEC_TRADE", y, "TRADE SETUP");
+   int colW = (ContentWidth() - INPUT_COL_GAP) / 2;
+   int rightX = PANEL_PADDING + colW + INPUT_COL_GAP;
+
+   MakeText(P+"L_NUM", PANEL_PADDING, y, "Trades", CLR_MUTED, 8, false);
+   MakeText(P+"L_LOT", rightX,        y, "Lots",   CLR_MUTED, 8, false);
+   y += ROW_HEIGHT;
+   MakeEdit(P+"E_NUM", PANEL_PADDING, y, colW, IntegerToString(g_PanelNumTrades));
+   MakeEdit(P+"E_LOT", rightX,        y, colW, DoubleToString(g_PanelLotSize, 2));
+   y += FIELD_HEIGHT + PANEL_GUTTER;
+
+   MakeText(P+"L_SL", PANEL_PADDING, y, "SL Pips", CLR_MUTED, 8, false);
+   MakeText(P+"L_TP", rightX,        y, "TP Pips", CLR_MUTED, 8, false);
+   y += ROW_HEIGHT;
+   MakeEdit(P+"E_SL", PANEL_PADDING, y, colW, "");
+   ApplyOptionalEditValue(P+"E_SL", g_PanelSL, SL_PLACEHOLDER);
+   MakeEdit(P+"E_TP", rightX, y, colW, "");
+   ApplyOptionalEditValue(P+"E_TP", g_PanelTP, TP_PLACEHOLDER);
+   y += FIELD_HEIGHT + 4;
+   MakeText(P+"H_SLTP", PANEL_PADDING, y, "Blank = No SL / TP", CLR_SUBTLE, 7, false);
+   return y + 18 + SECTION_GAP;
+  }
+
+int CreateButtons(int y)
+  {
+   y = CreateSectionHeader(P+"SEC_ACTION", y, "ACTION BUTTONS");
+   int halfW = (ContentWidth() - PANEL_GUTTER) / 2;
+   g_BuyX = PANEL_PADDING; g_BuyY = y; g_BuyW = halfW; g_BuyH = BUTTON_HEIGHT;
+   g_SellX = PANEL_PADDING + halfW + PANEL_GUTTER;
+   g_SellY = y; g_SellW = halfW; g_SellH = BUTTON_HEIGHT;
+
+   MakeButton(P+"BUY",  g_BuyX,  g_BuyY,  g_BuyW,  g_BuyH, "BUY  F1",  CLR_BUY,  clrWhite);
+   MakeButton(P+"SELL", g_SellX, g_SellY, g_SellW, g_SellH, "SELL  F2", CLR_SELL, clrWhite);
+   return y + BUTTON_HEIGHT + PANEL_GUTTER;
+  }
+
+int CreateTrailingSection(int y)
+  {
+   int valueW = 80;
+   MakeText(P+"L_TRAIL", PANEL_PADDING, y, "Trailing Stop:", CLR_MUTED, 8, false);
+   MakeValue(P+"TSTAT", PANEL_WIDTH - PANEL_PADDING - valueW, y,
+             valueW, "OFF", CLR_SUBTLE, 8, true);
+   y += ROW_HEIGHT;
+
+   g_TrailX = PANEL_PADDING; g_TrailY = y; g_TrailW = ContentWidth(); g_TrailH = BUTTON_HEIGHT;
+   MakeButton(P+"TRAIL", g_TrailX, g_TrailY, g_TrailW, g_TrailH,
+              "TRAILING STOP", CLR_TRAIL_DIS, CLR_MUTED);
+   y += BUTTON_HEIGHT + 4;
+   MakeText(P+"TINFO", PANEL_PADDING, y, "Configure in inputs", CLR_SUBTLE, 8, false);
+   RefreshTrailingButton();
+   return y + 18 + PANEL_GUTTER;
+  }
+
+int CreateManagementButtons(int y)
+  {
+   g_CloseX = PANEL_PADDING; g_CloseY = y; g_CloseW = ContentWidth(); g_CloseH = 32;
+   MakeButton(P+"CLOSE", g_CloseX, g_CloseY, g_CloseW, g_CloseH,
+              "CLOSE SELECTED  F3", CLR_CLOSE, clrWhite);
+   y += 32 + PANEL_GUTTER;
+
+   g_BeX = PANEL_PADDING; g_BeY = y; g_BeW = ContentWidth(); g_BeH = 32;
+   MakeButton(P+"BE", g_BeX, g_BeY, g_BeW, g_BeH,
+              "MOVE TO BREAKEVEN  F4", CLR_BE, clrWhite);
+   y += 32 + PANEL_GUTTER;
+
+   g_PartX = PANEL_PADDING; g_PartY = y; g_PartW = ContentWidth(); g_PartH = 32;
+   MakeButton(P+"PART", g_PartX, g_PartY, g_PartW, g_PartH,
+              "PARTIAL CLOSE  "+DoubleToString(PartialClosePct, 0)+"%",
+              CLR_PART, clrWhite);
+   return y + 32 + SECTION_GAP;
+  }
+
+int CreateBatchSection(int y)
+  {
+   y = CreateSectionHeader(P+"SEC_BATCH", y, "ACTIVE BATCH");
+
+   MakeButton(P+"BPREV", PANEL_PADDING, y, 34, 28, "<", CLR_SURFACE, CLR_TEXT);
+   MakeButton(P+"BNEXT", PANEL_WIDTH - PANEL_PADDING - 34, y, 34, 28, ">", CLR_SURFACE, CLR_TEXT);
+   MakeText(P+"BSEL", PANEL_PADDING + 46, y + 5, "No Active Batch", clrOrange, 8, true);
+   MakeValue(P+"BTICKET", PANEL_WIDTH - PANEL_PADDING - 154, y + 5,
+             108, "#--", CLR_MUTED, 8, false);
+   y += 34;
+
+   MakeText(P+"BMETA", PANEL_PADDING, y, "--", CLR_MUTED, 8, false);
+   MakeText(P+"L_BPOS", PANEL_PADDING + 190, y, "Pos:", CLR_MUTED, 8, false);
+   MakeValue(P+"BPOS", PANEL_PADDING + 226, y, 56, "0", CLR_MUTED, 8, true);
+   y += ROW_HEIGHT;
+
+   MakeText(P+"L_BLOTS", PANEL_PADDING, y, "Lots:", CLR_MUTED, 8, false);
+   MakeValue(P+"BLOTS", PANEL_PADDING + 46, y, 92, "--", CLR_MUTED, 8, true);
+   MakeText(P+"L_BTRAIL", PANEL_PADDING + 154, y, "Trail:", CLR_MUTED, 8, false);
+   MakeValue(P+"BTRAIL", PANEL_PADDING + 210, y, 56, "--", CLR_MUTED, 8, true);
+   MakeText(P+"L_BBE", PANEL_PADDING + 284, y, "BE:", CLR_MUTED, 8, false);
+   MakeValue(P+"BBE", PANEL_PADDING + 318, y, 54, "--", CLR_MUTED, 8, true);
+   y += ROW_HEIGHT;
+
+   MakeText(P+"L_BPNL", PANEL_PADDING, y, "P/L:", CLR_MUTED, 8, false);
+   MakeValue(P+"BPNL", PANEL_PADDING + 46, y, ContentWidth() - 46,
+             "--", CLR_MUTED, 9, true);
+   return y + ROW_HEIGHT + SECTION_GAP;
+  }
+
+int CreateStatusSection(int y)
+  {
+   int statusY = g_PanelHeight - STATUS_BAR_HEIGHT;
+   MakeRect(P+"SBAR", 0, statusY, PANEL_WIDTH, STATUS_BAR_HEIGHT, CLR_SURFACE, CLR_BORDER);
+   MakeText(P+"SLAB", PANEL_PADDING, statusY + 10, "Status:", CLR_SUBTLE, 8, false);
+   MakeValue(P+"STATUS", PANEL_PADDING + LABEL_WIDTH, statusY + 10,
+             ContentWidth() - LABEL_WIDTH, g_StatusText, g_StatusColor, 9, true);
+   return statusY + STATUS_BAR_HEIGHT;
   }
 
 //+------------------------------------------------------------------+
-//| CreatePanel — v4.07 layout, v4.08 version label                  |
+//| CreatePanel — responsive professional panel layout               |
 //+------------------------------------------------------------------+
 void CreatePanel()
   {
-   MakeRect(P+"BG", 0, 0, PW, g_PanelMinimized ? PH_MIN : PH, CLR_BG, CLR_BORDER);
+   UpdateLayout();
+   MakeRect(P+"BG", 0, 0, PANEL_WIDTH, CurrentPanelHeight(), CLR_BG, CLR_BORDER);
    MakePanelDragHandle(P+"BG");
 
-   MakeRect(P+"TBAR", 0, 0, PW, PH_MIN, CLR_SURFACE, CLR_BORDER);
-   MakePanelDragHandle(P+"TBAR");
-   MakeText(P+"TITLE", 16, 14, "APEX EXECUTION", CLR_TEXT, 12, true);
-   MakePanelDragHandle(P+"TITLE");
-   MakeText(P+"TSYM",  16, 43,
-            Symbol()+"  "+EnumToString((ENUM_TIMEFRAMES)Period()),
-            CLR_MUTED, 8, true);
-   MakePanelDragHandle(P+"TSYM");
-   MakeButton(P+"MIN", 354, 18, 30, 28,
-              g_PanelMinimized ? "+" : "-", CLR_SURFACE, CLR_TEXT);
+   int y = CreateHeader(0);
 
    if(g_PanelMinimized)
      {
       ChartRedraw();
-      return;
+     return;
      }
 
-   MakeRect(P+"LIVE", 12, 84, PW-24, 80, C'18,21,30', CLR_DIVIDER);
-   MakeText(P+"SPREAD", 22,  98, "Spread  --",        CLR_STATUS_OK, 9, true);
-   MakeText(P+"BAL",    22, 122, "Bal --",             CLR_MUTED,     8, false);
-   MakeText(P+"POS",    22, 146, "Positions  0 / 200", CLR_MUTED,     8, false);
-
-   MakeRect(P+"DIV1", 12, 172, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-   MakeText(P+"SEC1", 16, 184, "ORDER SETUP", CLR_SUBTLE, 8, true);
-
-   MakeText(P+"L_NUM", 16,  204, "TRADES",           CLR_MUTED, 7, true);
-   MakeEdit(P+"E_NUM", 16,  220, 170, IntegerToString(g_PanelNumTrades));
-   MakeText(P+"L_LOT", 214, 204, "LOTS",             CLR_MUTED, 7, true);
-   MakeEdit(P+"E_LOT", 214, 220, 170, DoubleToString(g_PanelLotSize, 2));
-
-   MakeText(P+"L_SL",  16,  258, "STOP LOSS PIPS",   CLR_MUTED, 7, true);
-   MakeEdit(P+"E_SL",  16,  274, 170, "");
-   ApplyOptionalEditValue(P+"E_SL", g_PanelSL, SL_PLACEHOLDER);
-   MakeText(P+"L_TP",  214, 258, "TAKE PROFIT PIPS", CLR_MUTED, 7, true);
-   MakeEdit(P+"E_TP",  214, 274, 170, "");
-   ApplyOptionalEditValue(P+"E_TP", g_PanelTP, TP_PLACEHOLDER);
-   MakeText(P+"H_SLTP", 16, 308, "Blank = No SL / TP", CLR_SUBTLE, 7, false);
-
-   MakeRect(P+"DIV2", 12, 322, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-
-   MakeButton(P+"BUY",  BUY_X,  BUY_Y,  BUY_W,  BUY_H,
-              "BUY  F1",  CLR_BUY,  clrWhite);
-   MakeButton(P+"SELL", SELL_X, SELL_Y, SELL_W, SELL_H,
-              "SELL  F2", CLR_SELL, clrWhite);
-
-   MakeRect(P+"DIV3", 12, 390, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-
-   {
-      color trailBg  = CLR_TRAIL_DIS;
-      color trailFg  = C'90,90,90';
-      string trailTxt= "TRAILING SL  ·  NOT CONFIGURED  F5";
-      if(TrailingStop > 0.0)
-        {
-         trailTxt = g_TrailingEnabled ? "TRAILING SL  ·  ACTIVE  F5"
-                                      : "TRAILING SL  ·  OFF  F5";
-         trailBg  = g_TrailingEnabled ? CLR_TRAIL_ON  : CLR_TRAIL_OFF;
-         trailFg  = g_TrailingEnabled ? clrWhite      : CLR_MUTED;
-        }
-      MakeButton(P+"TRAIL", TRAIL_X, TRAIL_Y, TRAIL_W, TRAIL_H,
-                 trailTxt, trailBg, trailFg);
-   }
-
-   {
-      string tinfo = (TrailingStop > 0.0)
-                     ? "Trail: "+DoubleToString(TrailingStop,0)+" pips   "+
-                       "Step: "+DoubleToString(TrailingStep,0)+" pips"
-                     : "Set TrailingStop > 0 in EA inputs to enable";
-      color tinfoClr = (TrailingStop > 0.0 && g_TrailingEnabled)
-                       ? CLR_STATUS_OK : CLR_SUBTLE;
-      MakeText(P+"TINFO", 22, 444, tinfo, tinfoClr, 8, false);
-   }
-
-   MakeRect(P+"DIV4", 12, 462, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-
-   MakeButton(P+"CLOSE", 16, 474, 368, 32,
-              "CLOSE SELECTED  F3",    CLR_CLOSE, clrWhite);
-   MakeButton(P+"BE",    16, 514, 368, 32,
-              "MOVE TO BREAKEVEN  F4", CLR_BE,    clrWhite);
-   MakeButton(P+"PART",  16, 554, 368, 32,
-              "PARTIAL CLOSE  "+DoubleToString(PartialClosePct, 0)+"%",
-              CLR_PART, clrWhite);
-
-   MakeRect(P+"DIV5", 12, 596, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-
-   MakeText(P+"SEC2",  16, 608, "ACTIVE BATCH", CLR_SUBTLE, 8, true);
-
-   MakeButton(P+"BPREV", 16,  626, 42, 28, "<", CLR_SURFACE, CLR_TEXT);
-   MakeButton(P+"BNEXT", 342, 626, 42, 28, ">", CLR_SURFACE, CLR_TEXT);
-   MakeText(P+"BSEL",  70, 631, "No Active Batches", clrOrange, 8, true);
-
-   MakeText(P+"BMETA",  16,  664, "Symbol --   Pos 0",  CLR_MUTED, 8, false);
-   MakeText(P+"BLOTS",  16,  680, "Lots: --",            CLR_MUTED, 8, false);
-   MakeText(P+"BPNL",   200, 680, "P/L: --",             CLR_MUTED, 8, true);
-   MakeText(P+"BTRAIL", 16,  696, "Trail: --",           CLR_MUTED, 8, false);
-   MakeText(P+"BBE",    190, 696, "BE: --",              CLR_MUTED, 8, false);
-
-   MakeRect(P+"DIV6", 12, 714, PW-24, 1, CLR_DIVIDER, CLR_DIVIDER);
-
-   MakeRect(P+"SBAR",   0,   718, PW, 56,  CLR_SURFACE, CLR_BORDER);
-   MakeText(P+"SLAB",  16,  726, "STATUS",  CLR_SUBTLE,    7, true);
-   MakeText(P+"STATUS",16,  742, "Ready",   CLR_STATUS_OK, 9, true);
-
-   RefreshBatchPanel();
+   y = CreateAccountSection(y);
+   y = CreateTradeSection(y);
+   y = CreateButtons(y);
+   y = CreateTrailingSection(y);
+   y = CreateManagementButtons(y);
+   y = CreateBatchSection(y);
+   CreateStatusSection(y);
+   UpdateDynamicValues();
    ChartRedraw();
   }
 
