@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.08"
+#property version   "4.09"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -232,7 +232,12 @@ const int INTEGRITY_CHECK_INTERVAL_MS= 60000;
 
 const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 360;
 const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
-const int MAX_CLOSES_PER_BATCH_PER_MIN    = 60;
+
+// v4.09 fix: raised from 60 to 250.
+// Root cause of partial-close/close-all stopping at 60 positions:
+// CloseAllBatch and PartialCloseBatch now also pass skipBatchRateLimit=true,
+// so this constant only throttles any future automated (non-user-initiated) close paths.
+const int MAX_CLOSES_PER_BATCH_PER_MIN    = 250;
 const int MAX_GLOBAL_CONCURRENT_CLOSES    = 4;
 
 // v4.07: M-AUDIT-001 fix
@@ -396,7 +401,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(100))
       LogEvent("INIT_WARN", "Timer setup failed. Error="+IntegerToString(GetLastError()));
 
-   Print("ApexExecution v4.08: Ready on ", Symbol());
+   Print("ApexExecution v4.09: Ready on ", Symbol());
    return INIT_SUCCEEDED;
   }
 
@@ -1634,7 +1639,11 @@ bool CloseAllBatch(long magic)
       if(posInfo.Symbol() != batchSymbol) continue;
 
       uint rc = 0;
-      bool ok = ClosePositionSafe(posInfo.Ticket(), rc, "CLOSE_BATCH");
+      // v4.09: skipBatchRateLimit=true — user-initiated bulk close must not be
+      // throttled by MAX_CLOSES_PER_BATCH_PER_MIN. All broker protection is
+      // already provided by ThrottleTradeRequest(), IsUnderRetryCooldown(),
+      // and MAX_GLOBAL_CONCURRENT_CLOSES.
+      bool ok = ClosePositionSafe(posInfo.Ticket(), rc, "CLOSE_BATCH", true);
       if(ok)  closed++;
       if(!ok) failed++;
      }
@@ -1849,7 +1858,10 @@ int PartialCloseBatch(long magic)
          continue;
 
       uint rc = 0;
-      if(ClosePositionPartialSafe(posInfo.Ticket(), closeV, rc, "PARTIAL_CLOSE"))
+      // v4.09: skipBatchRateLimit=true — user-initiated partial close must not be
+      // throttled by MAX_CLOSES_PER_BATCH_PER_MIN. Broker protection provided by
+      // ThrottleTradeRequest(), IsUnderRetryCooldown(), MAX_GLOBAL_CONCURRENT_CLOSES.
+      if(ClosePositionPartialSafe(posInfo.Ticket(), closeV, rc, "PARTIAL_CLOSE", true))
          done++;
      }
 
@@ -2567,7 +2579,14 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
   }
 
 // H-002 fix: retry cooldown check before close-count accounting
-bool ClosePositionSafe(ulong ticket, uint &rc, string context)
+// v4.09: added skipBatchRateLimit parameter.
+// When true (set by CloseAllBatch), the MAX_CLOSES_PER_BATCH_PER_MIN gate is bypassed.
+// Rationale: all close operations in this EA are user-initiated. The per-batch rate
+// limit was designed for automated paths that don't exist here. Broker-side protection
+// is already provided by ThrottleTradeRequest(), IsUnderRetryCooldown(), and
+// MAX_GLOBAL_CONCURRENT_CLOSES.
+bool ClosePositionSafe(ulong ticket, uint &rc, string context,
+                       bool skipBatchRateLimit = false)
   {
    rc = 0;
 
@@ -2600,7 +2619,8 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
          g_Batches[bidx].closeWindowStartMs = now;
          g_Batches[bidx].closeCount = 0;
         }
-      if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
+      if(!skipBatchRateLimit &&
+         g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
         {
          rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
          LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
@@ -2642,8 +2662,9 @@ bool ClosePositionSafe(ulong ticket, uint &rc, string context)
    return false;
   }
 
+// v4.09: added skipBatchRateLimit parameter — same rationale as ClosePositionSafe.
 bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
-                              string context)
+                              string context, bool skipBatchRateLimit = false)
   {
    rc = 0;
    if(volume <= 0.0) return false;
@@ -2677,7 +2698,8 @@ bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
          g_Batches[bidx].closeWindowStartMs = now;
          g_Batches[bidx].closeCount = 0;
         }
-      if(g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
+      if(!skipBatchRateLimit &&
+         g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
         {
          rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
          LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
