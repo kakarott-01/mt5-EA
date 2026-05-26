@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.09"
+#property version   "4.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -215,6 +215,21 @@ uint   g_PendingExecPostAttachMs = 0;
 double g_PendingExecBatchSLPrice = 0.0;
 double g_PendingExecBatchTPPrice = 0.0;
 
+// v4.10: Async burst close dispatcher state
+// Tickets and volumes are snapshotted once at initializer entry.
+// Volumes[i] == 0.0 → full close; > 0.0 → partial close by that volume.
+// g_PendingCloseIsPartial distinguishes CloseAll vs PartialClose for
+// finalization log message and batch-removal decision.
+bool   g_PendingCloseActive      = false;
+bool   g_PendingCloseIsPartial   = false;
+long   g_PendingCloseBatchID     = 0;
+ulong  g_PendingCloseTickets[];
+double g_PendingCloseVolumes[];
+int    g_PendingCloseTotal       = 0;
+int    g_PendingCloseDispatched  = 0;
+int    g_PendingCloseErrors      = 0;
+uint   g_PendingCloseLastBurstMs = 0;
+
 //+------------------------------------------------------------------+
 //| CONSTANTS                                                        |
 //+------------------------------------------------------------------+
@@ -228,22 +243,19 @@ const int RETRY_ESCALATION_FACTOR = 4;
 const int EXEC_STATE_TIMEOUT_MS      = 10000;
 const int EXEC_EXECUTING_TIMEOUT_MS  = 360000;
 const int EXEC_MODIFYING_TIMEOUT_MS  = 30000;
+// v4.10: close burst timeout — 200 positions × ~200ms bursts + broker latency headroom
+const int EXEC_CLOSING_TIMEOUT_MS    = 120000;
 const int INTEGRITY_CHECK_INTERVAL_MS= 60000;
 
 const int MAX_MODIFIES_PER_BATCH_PER_MIN  = 360;
 const int MAX_GLOBAL_CONCURRENT_MODIFIES  = 6;
 
-// v4.09 fix: raised from 60 to 250.
-// Root cause of partial-close/close-all stopping at 60 positions:
-// CloseAllBatch and PartialCloseBatch now also pass skipBatchRateLimit=true,
-// so this constant only throttles any future automated (non-user-initiated) close paths.
 const int MAX_CLOSES_PER_BATCH_PER_MIN    = 250;
 const int MAX_GLOBAL_CONCURRENT_CLOSES    = 4;
 
-// v4.07: M-AUDIT-001 fix
 const int MAX_MODIFY_QUEUE_SIZE = 250;
 
-// v4.08: Async burst dispatcher constants
+// v4.08: Async burst dispatcher constants (shared by entry and close engines)
 // BURST_ORDER_LIMIT: max orders per burst window. Reduce to 25-30 if Exness returns 10027.
 // BURST_COOLDOWN_MS: gap between bursts. 5 bursts x 200ms = ~1s for 200 orders.
 // POST_ATTACH_DELAY_MS: timer-gated wait replacing Sleep(250) in PostFillAttachSLTP.
@@ -260,7 +272,6 @@ const string TP_PLACEHOLDER = "100";
 const int    PR             = 36;
 const int    PT             = 45;
 
-// Responsive panel layout constants
 const int    PANEL_WIDTH       = 420;
 const int    PANEL_PADDING     = 16;
 const int    PANEL_GUTTER      = 10;
@@ -348,6 +359,9 @@ bool IsBatchBreakevenActive(long magic, string symbol);
 void ToggleTrailing();
 void ProcessExecutionBurst();
 bool DispatchOrderNow(int direction, double lot, string comment, uint &rc);
+void ProcessClosingBurst();
+bool DispatchCloseNow(ulong ticket, double volume, uint &rc);
+void _FinalizeClosure();
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -401,7 +415,7 @@ int OnInit()
    if(!EventSetMillisecondTimer(100))
       LogEvent("INIT_WARN", "Timer setup failed. Error="+IntegerToString(GetLastError()));
 
-   Print("ApexExecution v4.09: Ready on ", Symbol());
+   Print("ApexExecution v4.10: Ready on ", Symbol());
    return INIT_SUCCEEDED;
   }
 
@@ -413,13 +427,25 @@ void OnDeinit(const int reason)
    g_IsDeinitializing = true;
    g_AbortFlag        = true;
 
-   // v4.08: abort any in-progress async burst
+   // v4.08: abort any in-progress entry burst
    if(g_PendingExecActive || g_PendingExecPostAttach)
      {
       g_PendingExecActive     = false;
       g_PendingExecPostAttach = false;
       trade.SetAsyncMode(false);
-      LogEvent("DEINIT", "Aborted active burst dispatcher on deinit");
+      LogEvent("DEINIT", "Aborted active entry burst dispatcher on deinit");
+     }
+
+   // v4.10: abort any in-progress close burst
+   if(g_PendingCloseActive)
+     {
+      g_PendingCloseActive = false;
+      ArrayResize(g_PendingCloseTickets, 0);
+      ArrayResize(g_PendingCloseVolumes, 0);
+      trade.SetAsyncMode(false);
+      LogEvent("DEINIT", "Aborted active close burst dispatcher on deinit dispatched="+
+               IntegerToString(g_PendingCloseDispatched)+
+               "/"+IntegerToString(g_PendingCloseTotal));
      }
 
    SavePanelLayout();
@@ -554,9 +580,13 @@ void OnTimer()
         }
      }
 
-   //--- v4.08: Async burst execution engine
+   //--- v4.08: Async entry burst engine
    if(g_PendingExecActive || g_PendingExecPostAttach)
       ProcessExecutionBurst();
+
+   //--- v4.10: Async close burst engine
+   if(g_PendingCloseActive)
+      ProcessClosingBurst();
 
    //--- Drop closed batches; purge zombie retry/lock entries
    if(connected)
@@ -1050,6 +1080,36 @@ bool DispatchOrderNow(int direction, double lot, string comment, uint &rc)
   }
 
 //+------------------------------------------------------------------+
+//| DispatchCloseNow — v4.10                                         |
+//| Non-blocking single close dispatch for use in close burst only.  |
+//| volume == 0.0 → full close; > 0.0 → partial close.              |
+//| Caller must have already set trade.SetAsyncMode(true).           |
+//| No Sleep(). No retry. One call, one result.                      |
+//+------------------------------------------------------------------+
+bool DispatchCloseNow(ulong ticket, double volume, uint &rc)
+  {
+   rc = 0;
+   if(g_AbortFlag || g_IsDeinitializing ||
+      !TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      rc = TRADE_RETCODE_CONNECTION;
+      return false;
+     }
+
+   ResetLastError();
+   g_LastTradeActionMs = GetTickCount();
+
+   bool ok = (volume <= 0.0)
+             ? trade.PositionClose(ticket)
+             : trade.PositionClosePartial(ticket, volume);
+
+   rc = trade.ResultRetcode();
+   bool success = (ok && IsSuccessRetcode(rc));
+   UpdateTradePacing(rc, success);
+   return success;
+  }
+
+//+------------------------------------------------------------------+
 //| ProcessExecutionBurst — v4.08                                    |
 //| Called on every OnTimer() tick while g_IsExecuting is true.      |
 //|                                                                  |
@@ -1255,6 +1315,169 @@ void ProcessExecutionBurst()
       LogEvent("BURST_COMPLETE", "dispatched="+IntegerToString(g_PendingExecDispatched)+
                " moving to post-attach phase");
      }
+  }
+
+//+------------------------------------------------------------------+
+//| ProcessClosingBurst — v4.10                                      |
+//| Called on every OnTimer() tick while g_PendingCloseActive=true.  |
+//|                                                                  |
+//| Fires up to BURST_ORDER_LIMIT async close/partial-close orders   |
+//| per BURST_COOLDOWN_MS window, against a pre-snapshotted ticket   |
+//| array. Positions closed externally (SL/TP hit, manual) between   |
+//| bursts are safely skipped via PositionSelectByTicket() + magic.  |
+//|                                                                  |
+//| SetAsyncMode(true) is active ONLY inside the burst firing loop.  |
+//| It is explicitly restored to false in ALL exit paths.            |
+//+------------------------------------------------------------------+
+void ProcessClosingBurst()
+  {
+   if(g_IsDeinitializing) return;
+
+   uint now = GetTickCount();
+
+   //--- Disconnect guard — transition to finalization with partial results
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      trade.SetAsyncMode(false);
+      string msg = "Disconnected mid-close. Dispatched "+
+                   IntegerToString(g_PendingCloseDispatched)+
+                   "/"+IntegerToString(g_PendingCloseTotal);
+      SetStatus(msg, CLR_STATUS_WARN);
+      LogEvent("CLOSE_BURST_ABORT", msg+" batchID="+
+               IntegerToString(g_PendingCloseBatchID));
+      _FinalizeClosure();
+      return;
+     }
+
+   //--- Burst time gate
+   if(g_PendingCloseLastBurstMs != 0 &&
+      now - g_PendingCloseLastBurstMs < (uint)BURST_COOLDOWN_MS)
+      return;
+
+   g_PendingCloseLastBurstMs = now;
+
+   int remaining  = g_PendingCloseTotal - g_PendingCloseDispatched;
+   int burstCount = MathMin(BURST_ORDER_LIMIT, remaining);
+
+   //--- Enable async mode for burst window ONLY
+   trade.SetAsyncMode(true);
+   bool fatalError = false;
+
+   for(int i = 0; i < burstCount; i++)
+     {
+      int idx = g_PendingCloseDispatched;
+
+      if(g_AbortFlag || g_IsDeinitializing ||
+         !TerminalInfoInteger(TERMINAL_CONNECTED))
+        {
+         LogEvent("CLOSE_BURST_INTERRUPT",
+                  "Abort/disconnect in close burst loop idx="+IntegerToString(idx));
+         fatalError = true;
+         break;
+        }
+
+      ulong  ticket = g_PendingCloseTickets[idx];
+      double volume = g_PendingCloseVolumes[idx];
+
+      //--- Live validation: position may have been closed by SL/TP or manually,
+      //    or a different EA/manual trade may have taken the ticket since snapshot.
+      if(!PositionSelectByTicket(ticket) ||
+         (long)PositionGetInteger(POSITION_MAGIC) != g_PendingCloseBatchID)
+        {
+         LogEvent("CLOSE_BURST_SKIP", "ticket="+IntegerToString((long)ticket)+
+                  " not found or magic mismatch (already closed) idx="+
+                  IntegerToString(idx));
+         g_PendingCloseDispatched++;
+         continue;
+        }
+
+      uint rc   = 0;
+      bool sent = DispatchCloseNow(ticket, volume, rc);
+
+      if(sent)
+        {
+         g_PendingCloseDispatched++;
+        }
+      else if(rc == TRADE_RETCODE_CONNECTION   ||
+              rc == TRADE_RETCODE_TRADE_DISABLED||
+              rc == TRADE_RETCODE_MARKET_CLOSED)
+        {
+         g_PendingCloseErrors++;
+         LogEvent("CLOSE_BURST_FATAL", "rc="+IntegerToString((int)rc)+
+                  " ticket="+IntegerToString((long)ticket)+
+                  " batch="+IntegerToString(g_PendingCloseBatchID));
+         fatalError = true;
+         break;
+        }
+      else
+        {
+         // Non-fatal (10027 TOO_MANY_REQUESTS, requote, etc.):
+         // Advance pointer — position remains open. User can re-trigger.
+         LogTradeFailure("CLOSE_BURST_TICKET_"+IntegerToString((long)ticket),
+                         rc, 0, trade.ResultComment());
+         g_PendingCloseErrors++;
+         g_PendingCloseDispatched++;
+        }
+     }
+
+   //--- Restore sync mode immediately — never leave async mode on after burst
+   trade.SetAsyncMode(false);
+
+   string opType = g_PendingCloseIsPartial ? "Partial close" : "Closing";
+   SetStatus(opType+": "+IntegerToString(g_PendingCloseDispatched)+
+             "/"+IntegerToString(g_PendingCloseTotal), CLR_STATUS_EXEC);
+
+   LogEvent("CLOSE_BURST_TICK",
+            "dispatched="+IntegerToString(g_PendingCloseDispatched)+
+            " total="+IntegerToString(g_PendingCloseTotal)+
+            " errors="+IntegerToString(g_PendingCloseErrors)+
+            " fatal="+IntegerToString(fatalError ? 1 : 0));
+
+   if(fatalError || g_PendingCloseDispatched >= g_PendingCloseTotal)
+      _FinalizeClosure();
+  }
+
+//+------------------------------------------------------------------+
+//| _FinalizeClosure — v4.10                                         |
+//| Internal finalizer for ProcessClosingBurst().                    |
+//| Restores sync mode, emits summary, releases exec state.          |
+//| Does NOT call RemoveBatch() — CleanupOrphanBatches() handles     |
+//| batch removal once broker fills settle and positions disappear.  |
+//+------------------------------------------------------------------+
+void _FinalizeClosure()
+  {
+   trade.SetAsyncMode(false);
+
+   string opType  = g_PendingCloseIsPartial ? "Partial close" : "Close";
+   string summary = opType+": "+IntegerToString(g_PendingCloseDispatched)+
+                    "/"+IntegerToString(g_PendingCloseTotal)+" dispatched";
+   if(g_PendingCloseErrors > 0)
+      summary += " ("+IntegerToString(g_PendingCloseErrors)+" errors)";
+
+   SetStatus(summary, (g_PendingCloseErrors == 0) ? CLR_STATUS_OK : CLR_STATUS_WARN);
+   LogEvent("CLOSE_SUMMARY", summary+" batchID="+
+            IntegerToString(g_PendingCloseBatchID));
+
+   // Full close with zero errors: update globals so other subsystems see fresh
+   // state immediately. CleanupOrphanBatches() will confirm removal once broker
+   // fills are settled on the next timer tick.
+   if(!g_PendingCloseIsPartial && g_PendingCloseErrors == 0)
+      SaveLatestBatchGlobals();
+
+   //--- Release snapshot memory
+   ArrayResize(g_PendingCloseTickets, 0);
+   ArrayResize(g_PendingCloseVolumes, 0);
+
+   g_PendingCloseActive     = false;
+   g_PendingCloseTotal      = 0;
+   g_PendingCloseDispatched = 0;
+   g_PendingCloseErrors     = 0;
+   g_PendingCloseLastBurstMs= 0;
+
+   UnlockButtons();
+   EnsureSelectedBatch();
+   RefreshPanel();
+   ReleaseExecState(EXEC_CLOSING);
   }
 
 //+------------------------------------------------------------------+
@@ -1574,9 +1797,8 @@ void PartialCloseSelectedBatch()
    long magic = GetSelectedBatchMagic();
    if(magic == 0)
      { SetStatus("No active batch selected.", CLR_STATUS_WARN); RefreshPanel(); return; }
-   int done = PartialCloseBatch(magic);
-   SetStatus("Partial close on "+IntegerToString(done)+" positions", CLR_STATUS_OK);
-   RefreshPanel();
+   // v4.10: PartialCloseBatch is async. Final status set by _FinalizeClosure().
+   PartialCloseBatch(magic);
   }
 
 //+------------------------------------------------------------------+
@@ -1604,63 +1826,87 @@ void ToggleTrailing()
   }
 
 //+------------------------------------------------------------------+
-//| CloseAllBatch                                                    |
+//| CloseAllBatch — v4.10: async initializer                         |
+//| Snapshots tickets into g_PendingCloseTickets[] using a single    |
+//| pre-allocation to PositionsTotal() then trimmed to exact count.  |
+//| Actual dispatch happens in ProcessClosingBurst() via OnTimer().  |
 //+------------------------------------------------------------------+
 bool CloseAllBatch(long magic)
   {
-   bool held = false;
-   if(g_ExecState != EXEC_CLOSING)
+   // Guard: reject if a close burst is already in flight
+   if(g_PendingCloseActive)
      {
-      if(!AcquireExecState(EXEC_CLOSING))
-        {
-         SetStatus("Close already in progress.", CLR_STATUS_WARN);
-         LogEvent("CLOSE_SKIP", "cannot acquire closing lock for batch="+
-                  IntegerToString(magic));
-         g_CloseSkipCount++;
-         return false;
-        }
-      held = true;
+      SetStatus("Close already in progress.", CLR_STATUS_WARN);
+      LogEvent("CLOSE_SKIP", "close burst already active for batch="+
+               IntegerToString(magic));
+      g_CloseSkipCount++;
+      return false;
+     }
+
+   if(!AcquireExecState(EXEC_CLOSING))
+     {
+      SetStatus("Close already in progress.", CLR_STATUS_WARN);
+      LogEvent("CLOSE_SKIP", "cannot acquire closing lock for batch="+
+               IntegerToString(magic));
+      g_CloseSkipCount++;
+      return false;
      }
 
    int batchIndex = FindBatchIndex(magic);
    if(batchIndex < 0 || !g_Batches[batchIndex].active)
      {
       SetStatus("No active batch to close.", CLR_STATUS_WARN);
-      if(held) ReleaseExecState(EXEC_CLOSING);
+      ReleaseExecState(EXEC_CLOSING);
       return false;
      }
    string batchSymbol = g_Batches[batchIndex].symbol;
 
-   int closed = 0, failed = 0;
+   //--- Pre-allocate to worst-case size; fill; then trim (single allocation,
+   //    avoids 200 consecutive ArrayResize(+1) heap reallocations)
+   int maxSlots = PositionsTotal();
+   ArrayResize(g_PendingCloseTickets, maxSlots);
+   ArrayResize(g_PendingCloseVolumes,  maxSlots);
+   int count = 0;
+
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Magic()  != magic) continue;
       if(posInfo.Symbol() != batchSymbol) continue;
-
-      uint rc = 0;
-      // v4.09: skipBatchRateLimit=true — user-initiated bulk close must not be
-      // throttled by MAX_CLOSES_PER_BATCH_PER_MIN. All broker protection is
-      // already provided by ThrottleTradeRequest(), IsUnderRetryCooldown(),
-      // and MAX_GLOBAL_CONCURRENT_CLOSES.
-      bool ok = ClosePositionSafe(posInfo.Ticket(), rc, "CLOSE_BATCH", true);
-      if(ok)  closed++;
-      if(!ok) failed++;
+      g_PendingCloseTickets[count] = posInfo.Ticket();
+      g_PendingCloseVolumes[count] = 0.0;   // 0.0 = full close
+      count++;
      }
 
-   if(failed == 0)
+   // Trim arrays to exact size
+   ArrayResize(g_PendingCloseTickets, count);
+   ArrayResize(g_PendingCloseVolumes,  count);
+
+   if(count == 0)
      {
-      RemoveBatch(magic);
-      SaveLatestBatchGlobals();
+      SetStatus("No positions to close in batch.", CLR_STATUS_WARN);
+      ReleaseExecState(EXEC_CLOSING);
+      return false;
      }
 
-   string msg = "Closed "+IntegerToString(closed)+" from batch "+
-                IntegerToString(magic);
-   if(failed > 0) msg += " | Failed: "+IntegerToString(failed);
-   SetStatus(msg, (failed == 0) ? CLR_STATUS_OK : CLR_STATUS_WARN);
-   LogEvent("CLOSE", msg);
-   if(held) ReleaseExecState(EXEC_CLOSING);
-   return (failed == 0);
+   //--- Arm the burst dispatcher
+   g_PendingCloseActive      = true;
+   g_PendingCloseIsPartial   = false;
+   g_PendingCloseBatchID     = magic;
+   g_PendingCloseTotal       = count;
+   g_PendingCloseDispatched  = 0;
+   g_PendingCloseErrors      = 0;
+   g_PendingCloseLastBurstMs = 0;   // zero = fire on very next timer tick
+
+   LockButtons();
+   SetStatus("Closing "+IntegerToString(count)+" positions...", CLR_STATUS_EXEC);
+   LogEvent("CLOSE_BURST_INIT", "batchID="+IntegerToString(magic)+
+            " total="+IntegerToString(count)+
+            " burstSize="+IntegerToString(BURST_ORDER_LIMIT)+
+            " cooldownMs="+IntegerToString(BURST_COOLDOWN_MS));
+
+   // RETURN — execution continues via ProcessClosingBurst() in OnTimer()
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -1817,31 +2063,50 @@ bool IsBatchBreakevenActive(long magic, string symbol)
   }
 
 //+------------------------------------------------------------------+
-//| PartialCloseBatch                                                |
+//| PartialCloseBatch — v4.10: async initializer                     |
+//| Snapshots tickets and partial volumes using single pre-alloc.    |
+//| Actual dispatch happens in ProcessClosingBurst() via OnTimer().  |
 //+------------------------------------------------------------------+
 int PartialCloseBatch(long magic)
   {
+   // Guard: reject if a close burst is already in flight
+   if(g_PendingCloseActive)
+     {
+      SetStatus("Close already in progress.", CLR_STATUS_WARN);
+      LogEvent("PARTIAL_SKIP", "close burst already active for batch="+
+               IntegerToString(magic));
+      g_CloseSkipCount++;
+      return 0;
+     }
+
    int batchIndex = FindBatchIndex(magic);
    if(batchIndex < 0 || !g_Batches[batchIndex].active) return 0;
 
    if(!AcquireExecState(EXEC_CLOSING))
      {
+      SetStatus("Close already in progress.", CLR_STATUS_WARN);
       LogEvent("PARTIAL_SKIP", "Exec state busy for batch="+IntegerToString(magic));
       g_CloseSkipCount++;
       return 0;
      }
 
    string batchSymbol = g_Batches[batchIndex].symbol;
-   int done = 0;
    double vStep = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_STEP);
    double vMin  = SymbolInfoDouble(batchSymbol, SYMBOL_VOLUME_MIN);
 
    if(vStep <= 0.0 || vMin <= 0.0)
      {
-      LogEvent("EXEC_FAIL", "Invalid volume settings for "+batchSymbol+" in partial close");
+      LogEvent("EXEC_FAIL", "Invalid volume settings for "+batchSymbol+
+               " in partial close");
       ReleaseExecState(EXEC_CLOSING);
       return 0;
      }
+
+   //--- Pre-allocate to worst-case size; fill; then trim (single allocation)
+   int maxSlots = PositionsTotal();
+   ArrayResize(g_PendingCloseTickets, maxSlots);
+   ArrayResize(g_PendingCloseVolumes,  maxSlots);
+   int count = 0;
 
    for(int i = PositionsTotal()-1; i >= 0; i--)
      {
@@ -1855,21 +2120,44 @@ int PartialCloseBatch(long magic)
       if(closeV >= vol)
          closeV = NormalizeDouble(vol - vMin, 2);
       if(closeV < vMin || vol - closeV < vMin)
-         continue;
+         continue;   // position too small to partially close
 
-      uint rc = 0;
-      // v4.09: skipBatchRateLimit=true — user-initiated partial close must not be
-      // throttled by MAX_CLOSES_PER_BATCH_PER_MIN. Broker protection provided by
-      // ThrottleTradeRequest(), IsUnderRetryCooldown(), MAX_GLOBAL_CONCURRENT_CLOSES.
-      if(ClosePositionPartialSafe(posInfo.Ticket(), closeV, rc, "PARTIAL_CLOSE", true))
-         done++;
+      g_PendingCloseTickets[count] = posInfo.Ticket();
+      g_PendingCloseVolumes[count] = closeV;   // partial close volume
+      count++;
      }
 
-   LogEvent("PARTIAL_CLOSE", "batch="+IntegerToString(magic)+
+   // Trim arrays to exact size
+   ArrayResize(g_PendingCloseTickets, count);
+   ArrayResize(g_PendingCloseVolumes,  count);
+
+   if(count == 0)
+     {
+      SetStatus("No eligible positions for partial close.", CLR_STATUS_WARN);
+      ReleaseExecState(EXEC_CLOSING);
+      return 0;
+     }
+
+   //--- Arm the burst dispatcher
+   g_PendingCloseActive      = true;
+   g_PendingCloseIsPartial   = true;
+   g_PendingCloseBatchID     = magic;
+   g_PendingCloseTotal       = count;
+   g_PendingCloseDispatched  = 0;
+   g_PendingCloseErrors      = 0;
+   g_PendingCloseLastBurstMs = 0;
+
+   LockButtons();
+   SetStatus("Partial close queued: "+IntegerToString(count)+" positions...",
+             CLR_STATUS_EXEC);
+   LogEvent("PARTIAL_BURST_INIT", "batchID="+IntegerToString(magic)+
+            " total="+IntegerToString(count)+
             " pct="+DoubleToString(PartialClosePct, 0)+
-            " positions="+IntegerToString(done));
-   ReleaseExecState(EXEC_CLOSING);
-   return done;
+            " burstSize="+IntegerToString(BURST_ORDER_LIMIT)+
+            " cooldownMs="+IntegerToString(BURST_COOLDOWN_MS));
+
+   // RETURN — execution continues via ProcessClosingBurst() in OnTimer()
+   return count;
   }
 
 //+------------------------------------------------------------------+
@@ -2251,10 +2539,13 @@ void ReleaseExecState(int expected)
   {
    uint now = GetTickCount();
    uint timeout;
+
    if(g_ExecState == EXEC_EXECUTING)
       timeout = (uint)EXEC_EXECUTING_TIMEOUT_MS;
    else if(g_ExecState == EXEC_MODIFYING)
       timeout = (uint)EXEC_MODIFYING_TIMEOUT_MS;
+   else if(g_ExecState == EXEC_CLOSING)
+      timeout = (uint)EXEC_CLOSING_TIMEOUT_MS;   // v4.10: 120s for large batches
    else
       timeout = (uint)EXEC_STATE_TIMEOUT_MS;
 
@@ -2274,6 +2565,24 @@ void ReleaseExecState(int expected)
          g_PendingExecPostAttach = false;
          trade.SetAsyncMode(false);
          UnlockButtons();
+        }
+      // v4.10: force-release the close burst dispatcher on EXEC_CLOSING timeout
+      if(g_ExecState == EXEC_CLOSING && g_PendingCloseActive)
+        {
+         g_PendingCloseActive      = false;
+         ArrayResize(g_PendingCloseTickets, 0);
+         ArrayResize(g_PendingCloseVolumes, 0);
+         g_PendingCloseTotal       = 0;
+         g_PendingCloseDispatched  = 0;
+         g_PendingCloseErrors      = 0;
+         g_PendingCloseLastBurstMs = 0;
+         trade.SetAsyncMode(false);
+         UnlockButtons();
+         LogEvent("EXEC_FORCE_RELEASE",
+                  "Close burst force-released after "+
+                  IntegerToString(EXEC_CLOSING_TIMEOUT_MS/1000)+"s timeout. Dispatched="+
+                  IntegerToString(g_PendingCloseDispatched)+
+                  "/"+IntegerToString(g_PendingCloseTotal));
         }
       LogEvent("EXEC_FORCE_RELEASE",
                "state="+ExecStateText(g_ExecState)+
@@ -2328,6 +2637,8 @@ void DiagnosticsTick()
             " trailing="+IntegerToString(g_TrailingEnabled ? 1 : 0)+
             " burstDispatched="+IntegerToString(g_PendingExecDispatched)+
             " burstTotal="+IntegerToString(g_PendingExecTotal)+
+            " closeDispatched="+IntegerToString(g_PendingCloseDispatched)+
+            " closeTotal="+IntegerToString(g_PendingCloseTotal)+
             " tSkip="+IntegerToString(g_TimerSkipCount)+
             " sSkip="+IntegerToString(g_SyncSkipCount)+
             " trSkip="+IntegerToString(g_TrailSkipCount)+
@@ -2572,169 +2883,6 @@ bool ModifyPositionSafe(ulong ticket, double sl, double tp, uint &rc,
                g_ModifyLocks[s] = ml;
            }
         }
-
-      Sleep(AdaptiveRetryDelayMs(attempt, rc));
-     }
-   return false;
-  }
-
-// H-002 fix: retry cooldown check before close-count accounting
-// v4.09: added skipBatchRateLimit parameter.
-// When true (set by CloseAllBatch), the MAX_CLOSES_PER_BATCH_PER_MIN gate is bypassed.
-// Rationale: all close operations in this EA are user-initiated. The per-batch rate
-// limit was designed for automated paths that don't exist here. Broker-side protection
-// is already provided by ThrottleTradeRequest(), IsUnderRetryCooldown(), and
-// MAX_GLOBAL_CONCURRENT_CLOSES.
-bool ClosePositionSafe(ulong ticket, uint &rc, string context,
-                       bool skipBatchRateLimit = false)
-  {
-   rc = 0;
-
-   if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
-     {
-      rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
-      return false;
-     }
-
-   if(IsUnderRetryCooldown(ticket))
-     {
-      rc = TRADE_RETCODE_LOCKED;
-      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
-      return false;
-     }
-
-   int bidx = -1;
-   if(PositionSelectByTicket(ticket))
-     {
-      long mg = (long)PositionGetInteger(POSITION_MAGIC);
-      bidx    = FindBatchIndex(mg);
-     }
-   if(bidx >= 0)
-     {
-      uint now = GetTickCount();
-      if(g_Batches[bidx].closeWindowStartMs == 0 ||
-         now - g_Batches[bidx].closeWindowStartMs > 60000)
-        {
-         g_Batches[bidx].closeWindowStartMs = now;
-         g_Batches[bidx].closeCount = 0;
-        }
-      if(!skipBatchRateLimit &&
-         g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
-        {
-         rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
-         return false;
-        }
-      g_Batches[bidx].closeCount++;
-     }
-
-   for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
-     {
-      if(g_IsDeinitializing || !TerminalInfoInteger(TERMINAL_CONNECTED))
-        {
-         rc = TRADE_RETCODE_CONNECTION;
-         return false;
-        }
-
-      ResetLastError();
-      ThrottleTradeRequest();
-      g_InFlightCloses++;
-      bool ok = trade.PositionClose(ticket);
-      g_InFlightCloses--;
-      rc = trade.ResultRetcode();
-      bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, success);
-      if(success)
-        {
-         ClearRetryState(ticket);
-         return true;
-        }
-
-      LogTradeFailure(context+"_CLOSE_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, 0, trade.ResultComment());
-      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc);
-      UpsertRetryStateOnFailure(ticket, attempt+1, baseCd);
-      if(!ShouldRetryTrade(rc)) return false;
-
-      Sleep(AdaptiveRetryDelayMs(attempt, rc));
-     }
-   return false;
-  }
-
-// v4.09: added skipBatchRateLimit parameter — same rationale as ClosePositionSafe.
-bool ClosePositionPartialSafe(ulong ticket, double volume, uint &rc,
-                              string context, bool skipBatchRateLimit = false)
-  {
-   rc = 0;
-   if(volume <= 0.0) return false;
-
-   if(g_InFlightCloses >= MAX_GLOBAL_CONCURRENT_CLOSES)
-     {
-      rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-      LogEvent("FLOOD_CLOSE_GLOBAL", context+" ticket="+IntegerToString((long)ticket));
-      return false;
-     }
-
-   if(IsUnderRetryCooldown(ticket))
-     {
-      rc = TRADE_RETCODE_LOCKED;
-      LogEvent("CLOSE_COOLDOWN", context+" ticket="+IntegerToString((long)ticket));
-      return false;
-     }
-
-   int bidx = -1;
-   if(PositionSelectByTicket(ticket))
-     {
-      long mg = (long)PositionGetInteger(POSITION_MAGIC);
-      bidx    = FindBatchIndex(mg);
-     }
-   if(bidx >= 0)
-     {
-      uint now = GetTickCount();
-      if(g_Batches[bidx].closeWindowStartMs == 0 ||
-         now - g_Batches[bidx].closeWindowStartMs > 60000)
-        {
-         g_Batches[bidx].closeWindowStartMs = now;
-         g_Batches[bidx].closeCount = 0;
-        }
-      if(!skipBatchRateLimit &&
-         g_Batches[bidx].closeCount >= MAX_CLOSES_PER_BATCH_PER_MIN)
-        {
-         rc = TRADE_RETCODE_TOO_MANY_REQUESTS;
-         LogEvent("FLOOD_CLOSE_BATCH", "batch="+IntegerToString(g_Batches[bidx].magic));
-         return false;
-        }
-      g_Batches[bidx].closeCount++;
-     }
-
-   for(int attempt = 0; attempt < TRADE_RETRY_MAX; attempt++)
-     {
-      if(g_IsDeinitializing || !TerminalInfoInteger(TERMINAL_CONNECTED))
-        {
-         rc = TRADE_RETCODE_CONNECTION;
-         return false;
-        }
-
-      ResetLastError();
-      ThrottleTradeRequest();
-      g_InFlightCloses++;
-      bool ok = trade.PositionClosePartial(ticket, volume);
-      g_InFlightCloses--;
-      rc = trade.ResultRetcode();
-      bool success = (ok && IsSuccessRetcode(rc));
-      UpdateTradePacing(rc, success);
-      if(success)
-        {
-         ClearRetryState(ticket);
-         return true;
-        }
-
-      LogTradeFailure(context+"_PARTIAL_ATTEMPT_"+IntegerToString(attempt+1),
-                      rc, 0, trade.ResultComment());
-      uint baseCd = (uint)AdaptiveRetryDelayMs(attempt, rc);
-      UpsertRetryStateOnFailure(ticket, attempt+1, baseCd);
-      if(!ShouldRetryTrade(rc)) return false;
 
       Sleep(AdaptiveRetryDelayMs(attempt, rc));
      }
@@ -4058,7 +4206,7 @@ void CreatePanel()
    if(g_PanelMinimized)
      {
       ChartRedraw();
-     return;
+      return;
      }
 
    y = CreateAccountSection(y);
