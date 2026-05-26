@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.10"
+#property version   "4.11"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -489,6 +489,18 @@ void OnTimer()
       ArrayResize(g_ModifyQueue, 0);
       g_ModifyTotalEnqueued = 0;
       LogEvent("RECONNECT", "Flushed modify queue on reconnect");
+
+      // v4.11: If a close burst was in flight during disconnect, abort it cleanly
+      // via _FinalizeClosure() so the exec state machine is fully reset.
+      // Common case: ProcessClosingBurst disconnect guard already handled this.
+      // This covers the rare fast-reconnect race (disconnect+reconnect < 100ms).
+      if(g_PendingCloseActive)
+        {
+         LogEvent("RECONNECT", "Aborting stale close burst on reconnect dispatched="+
+                  IntegerToString(g_PendingCloseDispatched)+
+                  "/"+IntegerToString(g_PendingCloseTotal));
+         _FinalizeClosure();
+        }
 
       g_PendingReconnectRebuild = true;
       g_PendingReconnectResync  = true;
