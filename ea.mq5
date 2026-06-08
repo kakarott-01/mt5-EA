@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Arunaditya Lal"
 #property link      "https://www.mql5.com"
-#property version   "4.11"
+#property version   "1.11"
 #property strict
 
 #include <Trade\Trade.mqh>
