@@ -263,6 +263,11 @@ const int BURST_ORDER_LIMIT    = 40;
 const int BURST_COOLDOWN_MS    = 200;
 const int POST_ATTACH_DELAY_MS = 500;
 
+// Position ceiling is enforced PER SYMBOL, not account-wide. PositionsTotal()
+// counts every open position on the account across all symbols/instances, so
+// the ceiling check must filter to Symbol() via CountSymbolPositions().
+const int MAX_POSITIONS_PER_SYMBOL = 200;
+
 //+------------------------------------------------------------------+
 //| PANEL CONSTANTS                                                  |
 //+------------------------------------------------------------------+
@@ -774,7 +779,7 @@ void OnChartEvent(const int    id,
       string txt = ObjectGetString(0, sparam, OBJPROP_TEXT);
       if(sparam == P+"E_NUM")
         {
-         g_PanelNumTrades = (int)MathMax(1, MathMin(200, StringToInteger(txt)));
+         g_PanelNumTrades = (int)MathMax(1, MathMin(MAX_POSITIONS_PER_SYMBOL, StringToInteger(txt)));
          ObjectSetString(0, P+"E_NUM", OBJPROP_TEXT,
                          IntegerToString(g_PanelNumTrades));
         }
@@ -891,12 +896,13 @@ void ExecuteOrders(int direction)
         }
      }
 
-   //--- 2. POSITION CEILING
-   int openCount = PositionsTotal();
-   int slots     = 200 - openCount;
+   //--- 2. POSITION CEILING (per symbol, not account-wide)
+   int openCount = CountSymbolPositions(Symbol());
+   int slots     = MAX_POSITIONS_PER_SYMBOL - openCount;
    if(slots <= 0)
      {
-      SetStatus("At 200-position limit. Aborted.", CLR_STATUS_WARN);
+      SetStatus("At "+IntegerToString(MAX_POSITIONS_PER_SYMBOL)+
+                "-position limit for "+Symbol()+". Aborted.", CLR_STATUS_WARN);
       UnlockButtons(); g_IsExecuting = false; ReleaseExecState(EXEC_EXECUTING);
       return;
      }
@@ -2918,6 +2924,21 @@ string BatchDirectionText(int direction)
    return (direction == 0) ? "BUY" : "SELL";
   }
 
+// Per-symbol position count — used to enforce MAX_POSITIONS_PER_SYMBOL.
+// Deliberately NOT filtered by magic: the ceiling applies to everything open
+// on this symbol (this EA's batches, other instances, manual positions),
+// matching how the broker's own margin/position limits work.
+int CountSymbolPositions(string symbol)
+  {
+   int n = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() == symbol) n++;
+     }
+   return n;
+  }
+
 int CountBatchPositions(long magic, string symbol)
   {
    int n = 0;
@@ -3822,10 +3843,10 @@ void UpdateDynamicValues()
       ObjectSetString(0, P+"EQ", OBJPROP_TEXT,
                       FitTextWidth("$"+DoubleToString(eq,2), 210, 8));
 
-   int   pos    = PositionsTotal();
-   color posClr = (pos >= 190) ? CLR_STATUS_WARN : CLR_MUTED;
+   int   pos    = CountSymbolPositions(Symbol());
+   color posClr = (pos >= MAX_POSITIONS_PER_SYMBOL - 10) ? CLR_STATUS_WARN : CLR_MUTED;
    ObjectSetString(0,  P+"POS",  OBJPROP_TEXT,
-                   IntegerToString(pos)+" / 200");
+                   IntegerToString(pos)+" / "+IntegerToString(MAX_POSITIONS_PER_SYMBOL));
    ObjectSetInteger(0, P+"POS",  OBJPROP_COLOR, posClr);
 
    RefreshTrailingButton();
@@ -4086,7 +4107,7 @@ int CreateAccountSection(int y)
                 "Equity:", "--");
    y += ROW_HEIGHT;
    MakeKeyValue(P+"L_POS", P+"POS", PANEL_PADDING, y, labelW, valueW,
-                "Positions:", "0 / 200");
+                "Positions:", "0 / "+IntegerToString(MAX_POSITIONS_PER_SYMBOL));
    return y + ROW_HEIGHT + SECTION_GAP;
   }
 
